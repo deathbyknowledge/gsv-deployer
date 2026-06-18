@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "gsv-deployment",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-15",
+  "workers_dev": true,
+  "preview_urls": true,
+  "kv_namespaces": [
+    {
+      "binding": "SESSIONS",
+      "id": "57f022cab6284099838e49a125d7d0ab"
+    }
+  ],
+  "workflows": [
+    {
+      "name": "gsv-deployment-workflow",
+      "binding": "DEPLOY_WORKFLOW",
+      "class_name": "GsvDeployWorkflow",
+      "limits": {
+        "steps": 100
+      }
+    }
+  ],
+  "vars": {
+    "APP_ORIGIN": "https://gsv-deployment.the-agents-company.workers.dev",
+    "GSV_REPO_OWNER": "deathbyknowledge",
+    "GSV_REPO_NAME": "gsv",
+    "GITHUB_REPO_URL": "https://github.com/deathbyknowledge/gsv",
+    "OAUTH_SCOPES": "account-settings.read user-details.read memberships.read workers-scripts.read workers-scripts.write workers-r2.read workers-r2.write workers-kv-storage.read workers-kv-storage.write ai.write",
+    "OAUTH_TOKEN_AUTH_METHOD": "client_secret_post"
+  },
+  "secrets": {
+    "required": [
+      "CF_OAUTH_CLIENT_ID",
+      "CF_OAUTH_CLIENT_SECRET",
+      "SESSION_SECRET"
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
