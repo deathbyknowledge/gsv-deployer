@@ -4,6 +4,7 @@ export type AppEnv = {
     CF_OAUTH_CLIENT_ID: string;
     CF_OAUTH_CLIENT_SECRET: string;
     GITHUB_REPO_URL: string;
+    GITHUB_TOKEN?: string;
     GSV_REPO_OWNER?: string;
     GSV_REPO_NAME?: string;
     OAUTH_SCOPES: string;

@@ -2,7 +2,8 @@ import { Hono } from "hono";
 
 export { GsvDeployWorkflow } from "./workflow";
 
-import { ALL_COMPONENTS } from "./deploy";
+import { ALL_COMPONENTS, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
+import departureMonoWoff2 from "./assets/departure-mono.woff2";
 import { appendLog, createJob, deleteDeployToken, failActiveJobStep, getJob, storeDeployToken, updateJob } from "./jobs";
 import { page } from "./html";
 import { fetchAccounts, getSessionWithId, handleCallback, logout, requireSession, startLogin } from "./oauth";
@@ -15,11 +16,20 @@ app.use("*", async (c, next) => {
   await next();
   c.res.headers.set(
     "Content-Security-Policy",
-    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    "default-src 'none'; img-src 'self' data:; font-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
   );
   c.res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
   c.res.headers.set("X-Content-Type-Options", "nosniff");
   c.res.headers.set("X-Frame-Options", "DENY");
+});
+
+app.get("/assets/departure-mono.woff2", () => {
+  return new Response(departureMonoWoff2, {
+    headers: {
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "Content-Type": "font/woff2",
+    },
+  });
 });
 
 app.get("/", async (c) => {
@@ -46,9 +56,13 @@ app.get("/deploy", async (c) => {
   }
 
   const accounts = await fetchAccounts(session.session.token.access_token);
+  const [releases, installations] = await Promise.all([
+    fetchReleaseOptions(c.env).catch(() => []),
+    findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []),
+  ]);
   return page(c, {
     title: "Deploy GSV",
-    body: accounts.length > 0 ? deployPage(accounts, c.env.OAUTH_SCOPES) : noAccountsPage(),
+    body: accounts.length > 0 ? deployPage(accounts, c.env.OAUTH_SCOPES, releases, installations) : noAccountsPage(),
     width: "wide",
   });
 });
@@ -63,7 +77,8 @@ app.post("/deploy", async (c) => {
 
   const form = await c.req.formData();
   const accounts = await fetchAccounts(current.session.token.access_token);
-  const accountId = stringField(form, "accountId");
+  const existingTarget = parseExistingTarget(stringField(form, "target"));
+  const accountId = existingTarget?.accountId ?? stringField(form, "accountId");
   const account = accounts.find((item) => item.id === accountId);
   if (!account) {
     return page(c, {
@@ -77,7 +92,7 @@ app.post("/deploy", async (c) => {
   const options: DeployOptions = {
     accountId,
     accountName: account.name,
-    instance: stringField(form, "instance") || "gsv",
+    instance: (existingTarget?.instance ?? stringField(form, "instance")) || "gsv",
     version: stringField(form, "version") || "latest",
     components: components.length > 0 ? components : [...ALL_COMPONENTS],
     discordBotToken: optionalStringField(form, "discordBotToken"),
@@ -172,6 +187,14 @@ function stringField(form: FormData, name: string): string {
 function optionalStringField(form: FormData, name: string): string | undefined {
   const value = stringField(form, name);
   return value || undefined;
+}
+
+function parseExistingTarget(value: string): { accountId: string; instance: string } | null {
+  const parts = value.split("|");
+  if (parts.length !== 3 || parts[0] !== "existing") return null;
+  const accountId = parts[1]?.trim();
+  const instance = parts[2]?.trim();
+  return accountId && instance ? { accountId, instance } : null;
 }
 
 export default app;

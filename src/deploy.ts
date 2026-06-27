@@ -4,7 +4,7 @@ import { ungzip } from "pako";
 import { parse as parseToml } from "smol-toml";
 
 import { appendLog, failActiveJobStep, getJob, updateJob, updateJobStep } from "./jobs";
-import type { AppEnv, DeployOptions, DeployStepId, DeployStepStatus } from "./types";
+import type { Account, AppEnv, DeployOptions, DeployStepId, DeployStepStatus } from "./types";
 
 const COMPONENT_GATEWAY = "gateway";
 const COMPONENT_RIPGIT = "ripgit";
@@ -45,8 +45,24 @@ const COMPONENT_TO_BUNDLE: Record<string, string> = {
 
 type GitHubRelease = {
   tag_name: string;
+  name?: string | null;
   prerelease?: boolean;
   draft?: boolean;
+  published_at?: string | null;
+};
+
+export type ReleaseOption = {
+  value: string;
+  label: string;
+  description: string;
+};
+
+export type ExistingGsvInstallation = {
+  accountId: string;
+  accountName: string;
+  instance: string;
+  components: string[];
+  scriptNames: string[];
 };
 
 type BundleManifest = {
@@ -178,6 +194,64 @@ class DeployLogger {
   step(stepId: DeployStepId, status: DeployStepStatus, detail?: string): Promise<void> {
     return updateJobStep(this.env, this.jobId, stepId, status, detail);
   }
+}
+
+export async function fetchReleaseOptions(env: AppEnv["Bindings"]): Promise<ReleaseOption[]> {
+  const options = defaultReleaseOptions();
+  if (!env.GITHUB_TOKEN?.trim()) return options;
+
+  const repoOwner = env.GSV_REPO_OWNER || "deathbyknowledge";
+  const repoName = env.GSV_REPO_NAME || "gsv";
+  const releases = await githubJson<GitHubRelease[]>(
+    `https://api.github.com/repos/${repoOwner}/${repoName}/releases?per_page=50`,
+    env,
+  );
+  for (const release of releases) {
+    if (release.draft || !release.tag_name) continue;
+    const suffix = release.prerelease ? " prerelease" : "";
+    const date = release.published_at ? `, ${release.published_at.slice(0, 10)}` : "";
+    options.push({
+      value: release.tag_name,
+      label: `${release.tag_name}${suffix}${date}`,
+      description: release.name?.trim() || release.tag_name,
+    });
+  }
+
+  return dedupeReleaseOptions(options);
+}
+
+function defaultReleaseOptions(): ReleaseOption[] {
+  return [
+    {
+      value: "latest",
+      label: "Latest stable",
+      description: "Recommended for most installs.",
+    },
+    {
+      value: "dev",
+      label: "Dev channel",
+      description: "Newest prerelease build.",
+    },
+  ];
+}
+
+export async function findExistingGsvInstallations(
+  accessToken: string,
+  accounts: Account[],
+): Promise<ExistingGsvInstallation[]> {
+  const installations: ExistingGsvInstallation[] = [];
+  for (const account of accounts) {
+    try {
+      const scripts = await listWorkerScripts(accessToken, account.id);
+      installations.push(...detectGsvInstallations(account, [...scripts.keys()]));
+    } catch {
+      // Account inspection is opportunistic. The deploy form should still render.
+    }
+  }
+  return installations.sort((a, b) => {
+    const account = a.accountName.localeCompare(b.accountName);
+    return account || a.instance.localeCompare(b.instance);
+  });
 }
 
 export async function runDeployJob(
@@ -369,6 +443,80 @@ function normalizeComponents(raw: string[]): string[] {
   return out;
 }
 
+function dedupeReleaseOptions(options: ReleaseOption[]): ReleaseOption[] {
+  const seen = new Set<string>();
+  const out: ReleaseOption[] = [];
+  for (const option of options) {
+    if (seen.has(option.value)) continue;
+    seen.add(option.value);
+    out.push(option);
+  }
+  return out;
+}
+
+function detectGsvInstallations(account: Account, scriptNames: string[]): ExistingGsvInstallation[] {
+  const scripts = new Set(scriptNames);
+  const instances = new Map<string, Set<string>>();
+  for (const scriptName of scripts) {
+    const match = componentForScriptName(scriptName);
+    if (!match) continue;
+    let components = instances.get(match.instance);
+    if (!components) {
+      components = new Set<string>();
+      instances.set(match.instance, components);
+    }
+    components.add(match.component);
+  }
+
+  for (const instance of instances.keys()) {
+    if (scripts.has(instance)) instances.get(instance)?.add(COMPONENT_GATEWAY);
+  }
+  if (scripts.has(SCRIPT_GATEWAY)) {
+    let components = instances.get(DEFAULT_DEPLOY_INSTANCE);
+    if (!components) {
+      components = new Set<string>();
+      instances.set(DEFAULT_DEPLOY_INSTANCE, components);
+    }
+    components.add(COMPONENT_GATEWAY);
+  }
+
+  return [...instances]
+    .filter(([, components]) => components.size > 0)
+    .map(([instance, components]) => ({
+      accountId: account.id,
+      accountName: account.name?.trim() || account.id,
+      instance,
+      components: [...components].sort((a, b) => deployOrder(a) - deployOrder(b)),
+      scriptNames: scriptNamesForDetectedInstance(instance, components).filter((name) => scripts.has(name)),
+    }));
+}
+
+function componentForScriptName(scriptName: string): { instance: string; component: string } | null {
+  if (scriptName === SCRIPT_RIPGIT) return { instance: DEFAULT_DEPLOY_INSTANCE, component: COMPONENT_RIPGIT };
+  const suffixes: Array<[string, string]> = [
+    ["-channel-whatsapp", COMPONENT_CHANNEL_WHATSAPP],
+    ["-channel-discord", COMPONENT_CHANNEL_DISCORD],
+    ["-channel-telegram", COMPONENT_CHANNEL_TELEGRAM],
+    ["-assembler", COMPONENT_ASSEMBLER],
+    ["-ripgit", COMPONENT_RIPGIT],
+  ];
+  for (const [suffix, component] of suffixes) {
+    if (!scriptName.endsWith(suffix)) continue;
+    const instance = scriptName.slice(0, -suffix.length);
+    return instance ? { instance, component } : null;
+  }
+  return scriptName === SCRIPT_GATEWAY ? { instance: DEFAULT_DEPLOY_INSTANCE, component: COMPONENT_GATEWAY } : null;
+}
+
+function scriptNamesForDetectedInstance(instance: string, components: Set<string>): string[] {
+  const deployInstance: DeployInstance = {
+    name: instance,
+    isDefault: instance === DEFAULT_DEPLOY_INSTANCE,
+    storageBucketName: `${instance}-storage`,
+  };
+  return [...components].map((component) => scriptNameForComponent(deployInstance, component));
+}
+
 function formatCount(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
@@ -509,19 +657,8 @@ async function resolveReleaseTag(
   }
 
   if (normalized === "dev") {
-    await logger.info("Resolving dev release.");
-    const fixed = await fetch(`https://api.github.com/repos/${repoOwner}/${repoName}/releases/tags/dev`, {
-      headers: { "User-Agent": "gsv-deployment" },
-    });
-    if (fixed.status !== 404) {
-      const release = (await parseJsonResponse(fixed, "Resolve dev release")) as GitHubRelease;
-      if (release.draft) throw new Error("Dev channel release is still a draft.");
-      return release.tag_name;
-    }
-    const releases = await githubJson<GitHubRelease[]>(`https://api.github.com/repos/${repoOwner}/${repoName}/releases?per_page=20`);
-    const prerelease = releases.find((release) => !release.draft && release.prerelease && isPrereleaseSemverTag(release.tag_name));
-    if (!prerelease) throw new Error("No dev or prerelease channel found.");
-    return prerelease.tag_name;
+    await logger.info("Using dev release channel.");
+    return "dev";
   }
 
   return version.trim();
@@ -568,13 +705,23 @@ function isStableSemverTag(tag: string): boolean {
   return /^v\d+\.\d+\.\d+$/.test(tag);
 }
 
-function isPrereleaseSemverTag(tag: string): boolean {
-  return /^v\d+\.\d+\.\d+-[A-Za-z0-9.-]+$/.test(tag);
+async function githubJson<T>(url: string, env: AppEnv["Bindings"]): Promise<T> {
+  const response = await githubApiFetch(url, env);
+  return parseJsonResponse(response, url) as Promise<T>;
 }
 
-async function githubJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: { "User-Agent": "gsv-deployment" } });
-  return parseJsonResponse(response, url) as Promise<T>;
+function githubApiFetch(url: string, env: AppEnv["Bindings"]): Promise<Response> {
+  return fetch(url, { headers: githubApiHeaders(env) });
+}
+
+function githubApiHeaders(env: AppEnv["Bindings"]): HeadersInit {
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "gsv-deployment",
+  };
+  const token = env.GITHUB_TOKEN?.trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
 }
 
 async function prepareBundles(

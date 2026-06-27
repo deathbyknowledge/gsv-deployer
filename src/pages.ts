@@ -1,74 +1,99 @@
 import type { Account, DeployJob } from "./types";
 import { ALL_COMPONENTS } from "./deploy";
+import type { ExistingGsvInstallation, ReleaseOption } from "./deploy";
 import { cloudflareMark, escapeHtml, octocatIcon } from "./html";
 
 export function homePage(repoUrl: string): string {
-  return `<section class="hero">
-  <p class="eyebrow">Deploy GSV</p>
-  <h1>${cloudflareMark()} GSV on Cloudflare</h1>
-  <p class="lede">Authorize Cloudflare, choose an account, and deploy a personal GSV without installing the CLI or creating an API token first.</p>
-  <p class="prose">This installer uses Cloudflare OAuth, keeps tokens server-side for a short session, deploys prebuilt release bundles to your selected account, and sends you to the new Gateway setup screen.</p>
-  <div class="actions">
-    <a class="button" href="/login">Log in with Cloudflare</a>
-    <a class="link-button" href="${escapeHtml(repoUrl)}">${octocatIcon()} GSV repo</a>
+  return `<section class="home-sheet">
+  <header class="home-masthead">
+    <strong>GSV</strong>
+    <span>General Systems Vehicle</span>
+  </header>
+  <div class="home-intro">
+    <article class="home-copy">
+      <p class="home-label">Cloud computer</p>
+      <h1>GSV</h1>
+      <p class="lede">A computer for humans and machines.</p>
+      <p class="prose">GSV is your cloud computer. It gives you a desktop, files, apps, agents, settings, connected devices, and integrations that can keep working even when one browser tab is closed.</p>
+      <div class="actions">
+        <a class="button" href="/login">Log in with Cloudflare</a>
+        <a class="link-button" href="${escapeHtml(repoUrl)}">${octocatIcon()} GSV repo</a>
+      </div>
+    </article>
+    <dl class="home-facts" aria-label="GSV overview">
+      <div><dt>Desktop</dt><dd>Chat, Files, Shell, Wiki, and the GSV console.</dd></div>
+      <div><dt>Agents</dt><dd>Personal, custom, package, and background agents that can work on your behalf.</dd></div>
+      <div><dt>Devices</dt><dd>Connect laptops, servers, and workstations so GSV can work where your files and tools live.</dd></div>
+      <div><dt>Knowledge</dt><dd>Files and Wiki keep durable material after a conversation ends.</dd></div>
+    </dl>
   </div>
 </section>
-<section class="section">
-  <h2>What It Deploys</h2>
-  <ul class="lean-list">
-    <li><span class="split"><span class="marker ok"></span><span><strong>Gateway</strong><br><span class="hint">Kernel, process runtime, web shell, package host, and Workers AI binding.</span></span></span></li>
-    <li><span class="split"><span class="marker ok"></span><span><strong>ripgit and assembler</strong><br><span class="hint">Repository-backed storage and package assembly services.</span></span></span></li>
-    <li><span class="split"><span class="marker warn"></span><span><strong>Adapters</strong><br><span class="hint">WhatsApp, Discord, and Telegram Workers are optional and can be configured later.</span></span></span></li>
-  </ul>
+<section class="home-manifest">
+  <div class="manifest-heading">
+    <h2>Component manifest</h2>
+    <span>Default install</span>
+  </div>
+  <div class="manifest-grid">
+    <div><strong>Core GSV</strong><span>Desktop, users, agents, files, settings, and first-run setup.</span></div>
+    <div><strong>Storage</strong><span>Home files, Wiki, package source, artifacts, and process state.</span></div>
+    <div><strong>Package builder</strong><span>Builds and installs GSV package apps.</span></div>
+    <div><strong>Channels</strong><span>Optional message adapters for WhatsApp, Discord, and Telegram.</span></div>
+  </div>
 </section>`;
 }
 
-export function deployPage(accounts: Account[], scopes: string): string {
+export function deployPage(
+  accounts: Account[],
+  scopes: string,
+  releases: ReleaseOption[],
+  installations: ExistingGsvInstallation[],
+): string {
   const accountOptions = accounts
     .map((account) => `<option value="${escapeHtml(account.id)}">${escapeHtml(displayAccount(account))}</option>`)
     .join("");
-  const componentChecks = ALL_COMPONENTS.map(
-    (component) => `<label class="check-row"><input type="checkbox" name="component" value="${component}" checked><span><strong>${component}</strong><span class="hint">${componentHint(component)}</span></span></label>`,
-  ).join("");
+  const componentChecks = ALL_COMPONENTS.map(componentControl).join("");
+  const existingTargets = renderExistingTargets(installations);
 
   return `<p class="eyebrow"><a href="/logout">Log out</a></p>
 <h1 class="page-title title-row">${cloudflareMark()} Deploy GSV</h1>
-<p class="prose">Choose the Cloudflare account and deployment shape. The installer will deploy to workers.dev and redirect you to browser setup when it finishes.</p>
+<p class="prose">Choose where this GSV should live and which release to install. Existing GSVs can be updated here too.</p>
 <form class="section form-grid" method="post" action="/deploy">
-  <label>
-    Cloudflare account
-    <select name="accountId" required>${accountOptions}</select>
-  </label>
-  <label>
-    Instance name
-    <input name="instance" value="gsv" pattern="[a-z0-9-]+" required>
-    <span class="hint">Use a unique prefix such as gsv-personal for a second install in the same account.</span>
-  </label>
+  <div>
+    <h2>Target</h2>
+    <div class="target-options">
+      <div class="target-card">
+        <label class="radio-row"><input type="radio" name="target" value="new" checked><span><strong>New GSV install</strong><span class="hint">Use the default name unless you need a second install in the same Cloudflare account.</span></span></label>
+        <label class="target-field">
+          Cloudflare account
+          <select name="accountId" required>${accountOptions}</select>
+        </label>
+      </div>
+      ${existingTargets}
+    </div>
+  </div>
   <label>
     Release
-    <input name="version" value="latest" required>
-    <span class="hint">Use latest, stable, dev, or a release tag such as v0.1.0.</span>
+    <select name="version" required>${renderReleaseOptions(releases)}</select>
+    <span class="hint">Exact release tags are loaded from GitHub. Use latest stable unless you need a specific build.</span>
   </label>
   <div>
     <h2>Components</h2>
     <div class="checks">${componentChecks}</div>
   </div>
-  <label>
-    Discord bot token
-    <input name="discordBotToken" type="password" autocomplete="off">
-    <span class="hint">Optional. You can also configure it later in GSV.</span>
-  </label>
-  <label>
-    Telegram bot token
-    <input name="telegramBotToken" type="password" autocomplete="off">
-    <span class="hint">Optional. You can also configure it later in GSV.</span>
-  </label>
-  <div class="panel">
-    <strong>Requested Cloudflare OAuth scopes</strong>
-    <p class="hint">${escapeHtml(scopes)}</p>
-  </div>
+  <details class="advanced">
+    <summary>Advanced</summary>
+    <label>
+      New install name
+      <input name="instance" value="gsv" pattern="[a-z0-9-]+" required>
+      <span class="hint">Only used for new installs. Pick a unique name such as gsv-personal when running multiple GSVs in one account.</span>
+    </label>
+    <div class="panel">
+      <strong>Requested Cloudflare OAuth scopes</strong>
+      <p class="hint">${escapeHtml(scopes)}</p>
+    </div>
+  </details>
   <div class="actions left">
-    <button class="button" type="submit">Deploy</button>
+    <button class="button" type="submit">Deploy or update</button>
     <a class="link-button" href="/logout">Cancel</a>
   </div>
 </form>`;
@@ -110,7 +135,7 @@ export function jobPage(job: DeployJob): string {
   <ul class="lean-list">
     <li><strong>Account</strong><span class="detail">${escapeHtml(job.options.accountName || job.options.accountId)}</span></li>
     <li><strong>Release</strong><span class="detail">${escapeHtml(job.result?.version || job.options.version)}</span></li>
-    <li><strong>Components</strong><span class="detail">${escapeHtml(job.options.components.join(", "))}</span></li>
+    <li><strong>Components</strong><span class="detail">${escapeHtml(formatComponents(job.options.components))}</span></li>
   </ul>
 </section>
 ${gateway}
@@ -132,23 +157,110 @@ function displayAccount(account: Account): string {
   return account.name?.trim() ? `${account.name} (${account.id})` : account.id;
 }
 
+function renderExistingTargets(installations: ExistingGsvInstallation[]): string {
+  if (installations.length === 0) {
+    return `<div class="target-note">No existing GSV installs were detected in the authorized accounts.</div>`;
+  }
+
+  return installations
+    .map(
+      (installation) => `<label class="target-card compact">
+  <input type="radio" name="target" value="existing|${escapeHtml(installation.accountId)}|${escapeHtml(installation.instance)}">
+  <span>
+    <strong>Update ${escapeHtml(installation.instance)}</strong>
+    <span class="hint">${escapeHtml(installation.accountName)}</span>
+    <span class="component-badges">${installation.components.map((component) => `<span>${escapeHtml(componentName(component))}</span>`).join("")}</span>
+  </span>
+</label>`,
+    )
+    .join("");
+}
+
+function renderReleaseOptions(releases: ReleaseOption[]): string {
+  const fallback =
+    releases.length > 0
+      ? releases
+      : [
+          { value: "latest", label: "Latest stable", description: "Recommended for most installs." },
+          { value: "dev", label: "Dev channel", description: "Newest prerelease build." },
+        ];
+  return fallback
+    .map((release) => `<option value="${escapeHtml(release.value)}">${escapeHtml(release.label)}</option>`)
+    .join("");
+}
+
+function componentControl(component: string): string {
+  const token = channelTokenField(component);
+  return `<div class="component-card">
+  <label class="check-row"><input type="checkbox" name="component" value="${component}" checked><span><strong>${escapeHtml(componentName(component))}</strong><span class="hint">${escapeHtml(componentHint(component))}</span></span></label>
+  ${token}
+</div>`;
+}
+
+function channelTokenField(component: string): string {
+  if (component === "channel-discord") {
+    return `<details class="component-options">
+  <summary>Discord bot token</summary>
+  <label>
+    Bot token
+    <input name="discordBotToken" type="password" autocomplete="off">
+    <span class="hint">Optional. You can also configure Discord later in GSV.</span>
+  </label>
+</details>`;
+  }
+  if (component === "channel-telegram") {
+    return `<details class="component-options">
+  <summary>Telegram bot token</summary>
+  <label>
+    Bot token
+    <input name="telegramBotToken" type="password" autocomplete="off">
+    <span class="hint">Optional. You can also configure Telegram later in GSV.</span>
+  </label>
+</details>`;
+  }
+  return "";
+}
+
+function componentName(component: string): string {
+  switch (component) {
+    case "ripgit":
+      return "Storage";
+    case "assembler":
+      return "Package builder";
+    case "gateway":
+      return "Core GSV";
+    case "channel-whatsapp":
+      return "WhatsApp channel";
+    case "channel-discord":
+      return "Discord channel";
+    case "channel-telegram":
+      return "Telegram channel";
+    default:
+      return component;
+  }
+}
+
 function componentHint(component: string): string {
   switch (component) {
     case "ripgit":
-      return " Git-backed storage service.";
+      return "Home files, Wiki, package source, artifacts, and process state.";
     case "assembler":
-      return " Package assembly service.";
+      return "Builds and installs GSV package apps.";
     case "gateway":
-      return " Main GSV worker and web shell.";
+      return "Desktop, users, agents, files, settings, and setup.";
     case "channel-whatsapp":
-      return " WhatsApp adapter worker.";
+      return "Optional WhatsApp message adapter.";
     case "channel-discord":
-      return " Discord adapter worker.";
+      return "Optional Discord message adapter.";
     case "channel-telegram":
-      return " Telegram adapter worker.";
+      return "Optional Telegram message adapter.";
     default:
       return "";
   }
+}
+
+function formatComponents(components: string[]): string {
+  return components.map(componentName).join(", ");
 }
 
 function renderSteps(job: DeployJob): string {

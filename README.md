@@ -48,6 +48,11 @@ npx wrangler secret put CF_OAUTH_CLIENT_SECRET
 npx wrangler secret put SESSION_SECRET
 ```
 
+Optionally set `GITHUB_TOKEN` to a read-only GitHub token that can access the
+configured GSV repository releases. The installer uses it only to load exact
+release tags for the deploy form; deploying `latest`, `stable`, `dev`, or an
+explicit tag does not require GitHub REST API access.
+
 The first deploy may use placeholder OAuth secrets only to discover the
 workers.dev URL. Replace them with the real `CF_OAUTH_CLIENT_ID` and
 `CF_OAUTH_CLIENT_SECRET` from the OAuth client before using `/login`.
