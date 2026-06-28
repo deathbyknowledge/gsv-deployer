@@ -19,8 +19,8 @@ export function homePage(repoUrl: string): string {
       <h1>GSV</h1>
       <p class="lede">a mind for your machines</p>
       <p class="prose">GSV is a personal AI computer that spans all your devices at once and stays awake even when they're asleep. One mind across all your machines — not stuck on any single one. Open source, running on the edge in your own Cloudflare account: your keys, your data. From ~$5/mo infra plus your own model costs. No box to babysit.</p>
-      <p class="prose">Here's also a <a href="https://docs.gsv.space/get-started/">get started guide</a>.</p>
-      <p class="prose">Cloudflare account on a Workers Paid plan (~$5/mo) and R2 object storage enabled required.</p>
+      <p class="prose"><a href="https://docs.gsv.space/get-started/">Get started guide</a></p>
+      <p class="prose"><em>Cloudflare account on a Workers Paid plan (~$5/mo) and R2 object storage enabled required.</em></p>
       <div class="actions">
         <a class="button" href="/login">Log in with Cloudflare</a>
         <a class="link-button" href="${escapeHtml(repoUrl)}">${octocatIcon()} GitHub</a>
