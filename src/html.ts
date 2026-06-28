@@ -243,8 +243,8 @@ p { color: var(--muted); margin: 0 0 1rem; }
 .lede {
   color: var(--text);
   font-family: var(--serif);
-  font-size: 1.08rem;
-  line-height: 1.55;
+  font-size: 1.35rem;
+  line-height: 1.45;
   margin: 0 0 1.15rem;
   max-width: 31rem;
 }
