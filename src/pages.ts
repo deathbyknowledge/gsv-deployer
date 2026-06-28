@@ -1,23 +1,30 @@
 import type { Account, DeployJob } from "./types";
 import { ALL_COMPONENTS } from "./deploy";
 import type { ExistingGsvInstallation, ReleaseOption } from "./deploy";
-import { cloudflareMark, escapeHtml, octocatIcon } from "./html";
+import { cloudflareMark, discordIcon, escapeHtml, octocatIcon, xIcon } from "./html";
 
 export function homePage(repoUrl: string): string {
   return `<section class="home-sheet">
   <header class="home-masthead">
-    <strong>GSV</strong>
-    <span>General Systems Vehicle</span>
+    <a href="https://gsv.space">gsv.space</a>
+    <div class="masthead-links">
+      <span>General Systems Vehicle</span>
+      <a href="https://discord.gg/hy9ExJJFvn" aria-label="Discord">${discordIcon()}</a>
+      <a href="https://x.com/humachinesinc" aria-label="X">${xIcon()}</a>
+    </div>
   </header>
   <div class="home-intro">
     <article class="home-copy">
       <p class="home-label">Cloud computer</p>
       <h1>GSV</h1>
-      <p class="lede">A computer for humans and machines.</p>
-      <p class="prose">GSV is your cloud computer. It gives you a desktop, files, apps, agents, settings, connected devices, and integrations that can keep working even when one browser tab is closed.</p>
+      <p class="lede">a mind for your machines</p>
+      <p class="prose">GSV is a personal AI computer that spans all your devices at once and stays awake even when they're asleep. One mind across all your machines — not stuck on any single one. Open source, running on the edge in your own Cloudflare account: your keys, your data. From ~$5/mo infra plus your own model costs. No box to babysit.</p>
+      <p class="prose">Here's also a <a href="https://docs.gsv.space/get-started/">get started guide</a>.</p>
+      <p class="prose">Cloudflare account on a Workers Paid plan (~$5/mo) and R2 object storage enabled required.</p>
       <div class="actions">
         <a class="button" href="/login">Log in with Cloudflare</a>
-        <a class="link-button" href="${escapeHtml(repoUrl)}">${octocatIcon()} GSV repo</a>
+        <a class="link-button" href="${escapeHtml(repoUrl)}">${octocatIcon()} GitHub</a>
+        <a class="link-button" href="https://docs.gsv.space">Docs</a>
       </div>
     </article>
     <dl class="home-facts" aria-label="GSV overview">
