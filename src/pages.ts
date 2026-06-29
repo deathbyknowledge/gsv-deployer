@@ -10,7 +10,7 @@ export function homePage(repoUrl: string): string {
     <div class="masthead-links">
       <span>General Systems Vehicle</span>
       <a href="https://discord.gg/hy9ExJJFvn" aria-label="Discord">${discordIcon()}</a>
-      <a href="https://x.com/humachinesinc" aria-label="X">${xIcon()}</a>
+      <a href="https://x.com/gsvspace" aria-label="X">${xIcon()}</a>
     </div>
   </header>
   <div class="home-intro">
