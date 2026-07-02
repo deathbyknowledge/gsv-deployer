@@ -4,6 +4,7 @@ export { GsvDeployWorkflow } from "./workflow";
 
 import { ALL_COMPONENTS, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
 import departureMonoWoff2 from "./assets/departure-mono.woff2";
+import { ANALYTICS_SCRIPT } from "./analytics";
 import { appendLog, createJob, deleteDeployToken, failActiveJobStep, getJob, storeDeployToken, updateJob } from "./jobs";
 import { page } from "./html";
 import { fetchAccounts, getSessionWithId, handleCallback, logout, requireSession, startLogin } from "./oauth";
@@ -16,7 +17,7 @@ app.use("*", async (c, next) => {
   await next();
   c.res.headers.set(
     "Content-Security-Policy",
-    "default-src 'none'; img-src 'self' data:; font-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    "default-src 'none'; img-src 'self' data:; font-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
   );
   c.res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
   c.res.headers.set("X-Content-Type-Options", "nosniff");
@@ -28,6 +29,15 @@ app.get("/assets/departure-mono.woff2", () => {
     headers: {
       "Cache-Control": "public, max-age=31536000, immutable",
       "Content-Type": "font/woff2",
+    },
+  });
+});
+
+app.get("/assets/analytics.js", () => {
+  return new Response(ANALYTICS_SCRIPT, {
+    headers: {
+      "Cache-Control": "public, max-age=3600",
+      "Content-Type": "text/javascript; charset=utf-8",
     },
   });
 });
@@ -118,7 +128,8 @@ app.post("/deploy", async (c) => {
     await appendLog(c.env, job.id, "error", `Failed to start deployment workflow: ${message}`);
     await updateJob(c.env, job.id, { status: "failed", error: message });
   }
-  return c.redirect(`/jobs/${job.id}`);
+  // `?submitted=1` signals the job page to fire the one-time deploy_submit event.
+  return c.redirect(`/jobs/${job.id}?submitted=1`);
 });
 
 app.get("/jobs/:id", async (c) => {
