@@ -151,7 +151,9 @@ ${gateway}
     <summary>Deployment details</summary>
     <pre class="log">${log || "Waiting for logs..."}</pre>
   </details>
-</section>`;
+</section>
+<div id="gsv-analytics" data-job-id="${escapeHtml(job.id)}" data-release="${escapeHtml(job.options.version)}" data-status="${escapeHtml(job.status)}" hidden></div>
+<script src="/assets/analytics.js"></script>`;
 }
 
 export function errorPage(title: string, message: string): string {
