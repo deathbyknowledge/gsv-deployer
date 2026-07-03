@@ -3,15 +3,20 @@ export type AppEnv = {
     APP_ORIGIN: string;
     CF_OAUTH_CLIENT_ID: string;
     CF_OAUTH_CLIENT_SECRET: string;
+    CF_ACCOUNT_ID: string;
+    CF_ANALYTICS_API_TOKEN: string;
     GITHUB_REPO_URL: string;
     GITHUB_TOKEN?: string;
     GSV_REPO_OWNER?: string;
     GSV_REPO_NAME?: string;
+    METRICS_USER: string;
+    METRICS_PASSWORD: string;
     OAUTH_SCOPES: string;
     OAUTH_TOKEN_AUTH_METHOD: string;
     SESSION_SECRET: string;
     SESSIONS: KVNamespace;
     DEPLOY_WORKFLOW: Workflow<DeployWorkflowParams>;
+    METRICS: AnalyticsEngineDataset;
   };
 };
 

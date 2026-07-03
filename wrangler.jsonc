@@ -20,6 +20,12 @@
 			"id": "57f022cab6284099838e49a125d7d0ab"
 		}
 	],
+	"analytics_engine_datasets": [
+		{
+			"binding": "METRICS",
+			"dataset": "gsv_deploy_metrics"
+		}
+	],
 	"workflows": [
 		{
 			"name": "gsv-deployment-workflow",
@@ -32,6 +38,7 @@
 	],
 	"vars": {
 		"APP_ORIGIN": "https://deploy.gsv.space",
+		"CF_ACCOUNT_ID": "f7c938a773193df3a4ac230b24bc8259",
 		"GSV_REPO_OWNER": "deathbyknowledge",
 		"GSV_REPO_NAME": "gsv",
 		"GITHUB_REPO_URL": "https://github.com/deathbyknowledge/gsv",
@@ -42,7 +49,10 @@
 		"required": [
 			"CF_OAUTH_CLIENT_ID",
 			"CF_OAUTH_CLIENT_SECRET",
-			"SESSION_SECRET"
+			"SESSION_SECRET",
+			"CF_ANALYTICS_API_TOKEN",
+			"METRICS_USER",
+			"METRICS_PASSWORD"
 		]
 	},
 	"observability": {

@@ -4,6 +4,7 @@ import { ungzip } from "pako";
 import { parse as parseToml } from "smol-toml";
 
 import { appendLog, failActiveJobStep, getJob, updateJob, updateJobStep } from "./jobs";
+import { trackEvent } from "./metrics";
 import type { Account, AppEnv, DeployOptions, DeployStepId, DeployStepStatus } from "./types";
 
 const COMPONENT_GATEWAY = "gateway";
@@ -268,6 +269,7 @@ export async function runDeployJob(
   try {
     const result = await deployGsv(env, job.options, accessToken, logger);
     await updateJob(env, jobId, { status: "succeeded", result });
+    trackEvent(env, "deploy_success", job.options.version);
     await logger.info("Deployment complete.");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

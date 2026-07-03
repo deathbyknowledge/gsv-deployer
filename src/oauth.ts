@@ -235,7 +235,7 @@ async function hmac(secret: string, value: string): Promise<string> {
   return base64url(signature);
 }
 
-function timingSafeEqual(a: string, b: string): boolean {
+export function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
 
   let mismatch = 0;

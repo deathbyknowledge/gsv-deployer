@@ -719,6 +719,31 @@ textarea:focus {
   margin: 0.35rem 0 0;
 }
 
+.metrics-table {
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  width: 100%;
+}
+
+.metrics-table th,
+.metrics-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+}
+
+.metrics-table th {
+  color: var(--accent);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
+.metrics-table td.num,
+.metrics-table th.num {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
 .diagnostics summary {
   cursor: pointer;
   font-weight: 700;
