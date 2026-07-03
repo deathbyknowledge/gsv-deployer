@@ -82,3 +82,63 @@ Future upgrades or teardown should ask the user to authorize again.
 Deployments run in a Cloudflare Workflow. The browser creates a deploy job,
 starts a Workflow instance, and then polls the job page while the Worker-side
 workflow performs the Cloudflare API calls.
+
+## Metrics
+
+The Worker writes two funnel events to a Workers Analytics Engine dataset
+(`gsv_deploy_metrics`, binding `METRICS`, created automatically on first
+write — no setup needed):
+
+- `login_view`: recorded on every `GET /login` hit, tagged `cta` (link click
+  from the home page) or `session_expired` (redirected here after an
+  expired/missing session on `/deploy` or `/jobs/:id`).
+- `deploy_view`: recorded on every `GET /deploy` that passes session auth,
+  tagged `has_accounts` or `no_accounts` depending on whether Cloudflare
+  returned an authorized account for the session.
+
+### Dashboard
+
+`GET /metrics` renders a small built-in dashboard (summary counts for 24h/7d/30d
+plus a 14-day daily breakdown with click-to-deploy conversion) so the team can
+check it in a browser instead of running SQL by hand. It's gated with HTTP
+Basic Auth, not the Cloudflare OAuth session, since anyone can self-authorize
+through `/login` to deploy their own GSV.
+
+Setup:
+
+1. Set the real account ID in `wrangler.jsonc` under `vars.CF_ACCOUNT_ID`
+   (replacing `replace-with-cloudflare-account-id`).
+2. Create a Cloudflare API token scoped to **Account Analytics: Read** for
+   that account (dash.cloudflare.com → My Profile → API Tokens), and set it:
+
+   ```bash
+   npx wrangler secret put CF_ANALYTICS_API_TOKEN
+   ```
+
+3. Pick a shared username/password for the team and set them:
+
+   ```bash
+   npx wrangler secret put METRICS_USER
+   npx wrangler secret put METRICS_PASSWORD
+   ```
+
+Then visit `https://deploy.gsv.space/metrics` and sign in with those
+credentials when prompted.
+
+### Querying directly
+
+You can also query the Analytics Engine SQL API directly (replace
+`$CF_ACCOUNT_ID` and `$CF_API_TOKEN`):
+
+```bash
+curl -s "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/analytics_engine/sql" \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  --data "SELECT blob1 AS event, blob2 AS tag, count() AS hits
+          FROM gsv_deploy_metrics
+          WHERE timestamp > NOW() - INTERVAL '7' DAY
+          GROUP BY blob1, blob2
+          ORDER BY blob1, hits DESC"
+```
+
+Analytics Engine data is sampled/aggregated and not queryable until a few
+minutes after ingestion.

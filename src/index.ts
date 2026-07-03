@@ -8,7 +8,16 @@ import { ANALYTICS_SCRIPT } from "./analytics";
 import { appendLog, createJob, deleteDeployToken, failActiveJobStep, getJob, storeDeployToken, updateJob } from "./jobs";
 import { page } from "./html";
 import { fetchAccounts, getSessionWithId, handleCallback, logout, requireSession, startLogin } from "./oauth";
-import { deployPage, errorPage, homePage, jobPage, noAccountsPage } from "./pages";
+import { deployPage, errorPage, homePage, jobPage, metricsPage, noAccountsPage } from "./pages";
+import {
+  fetchMetricsByCountry,
+  fetchMetricsByHour,
+  fetchMetricsDaily,
+  fetchMetricsSummary,
+  requestCountry,
+  requireMetricsAuth,
+  trackEvent,
+} from "./metrics";
 import type { AppEnv, DeployOptions } from "./types";
 
 const app = new Hono<AppEnv>();
@@ -51,7 +60,12 @@ app.get("/", async (c) => {
   });
 });
 
-app.get("/login", (c) => startLogin(c));
+app.get("/login", (c) => {
+  const referer = c.req.header("referer") ?? "";
+  const isSessionExpiredRedirect = referer.includes("/deploy") || referer.includes("/jobs/");
+  trackEvent(c.env, "login_view", isSessionExpiredRedirect ? "session_expired" : "cta", requestCountry(c.req.raw));
+  return startLogin(c);
+});
 
 app.get("/oauth/callback", (c) => handleCallback(c));
 
@@ -66,6 +80,7 @@ app.get("/deploy", async (c) => {
   }
 
   const accounts = await fetchAccounts(session.session.token.access_token);
+  trackEvent(c.env, "deploy_view", accounts.length > 0 ? "has_accounts" : "no_accounts", requestCountry(c.req.raw));
   const [releases, installations] = await Promise.all([
     fetchReleaseOptions(c.env).catch(() => []),
     findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []),
@@ -110,6 +125,7 @@ app.post("/deploy", async (c) => {
   };
 
   const job = await createJob(c.env, current.sessionId, options);
+  trackEvent(c.env, "deploy_submit", options.version, requestCountry(c.req.raw));
   await storeDeployToken(c.env, job.id, current.session.token.access_token);
   try {
     const instance = await c.env.DEPLOY_WORKFLOW.create({
@@ -164,6 +180,28 @@ app.get("/api/jobs/:id", async (c) => {
   const job = await getJob(c.env, c.req.param("id"));
   if (!job || job.sessionId !== current.sessionId) return c.json({ error: "Not found" }, 404);
   return c.json(job);
+});
+
+app.get("/metrics", async (c) => {
+  const denied = requireMetricsAuth(c);
+  if (denied) return denied;
+
+  try {
+    const [summary, daily, byCountry, byHour] = await Promise.all([
+      fetchMetricsSummary(c.env),
+      fetchMetricsDaily(c.env),
+      fetchMetricsByCountry(c.env),
+      fetchMetricsByHour(c.env),
+    ]);
+    return page(c, { title: "Metrics", body: metricsPage(summary, daily, byCountry, byHour), width: "wide" });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return page(c, {
+      title: "Metrics",
+      body: errorPage("Metrics unavailable", message),
+      status: 502,
+    });
+  }
 });
 
 app.get("/health", (c) => c.json({ ok: true }));

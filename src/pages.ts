@@ -2,6 +2,7 @@ import type { Account, DeployJob } from "./types";
 import { ALL_COMPONENTS } from "./deploy";
 import type { ExistingGsvInstallation, ReleaseOption } from "./deploy";
 import { cloudflareMark, discordIcon, escapeHtml, octocatIcon, xIcon } from "./html";
+import type { MetricsCountryRow, MetricsDailyRow, MetricsHourRow, MetricsSummaryRow } from "./metrics";
 
 export function homePage(repoUrl: string): string {
   return `<section class="home-sheet">
@@ -160,6 +161,162 @@ export function errorPage(title: string, message: string): string {
   return `<p class="eyebrow"><a href="/">Home</a></p>
 <h1 class="page-title">${escapeHtml(title)}</h1>
 <p class="prose">${escapeHtml(message)}</p>`;
+}
+
+export function metricsPage(
+  summary: MetricsSummaryRow[],
+  daily: MetricsDailyRow[],
+  byCountry: MetricsCountryRow[],
+  byHour: MetricsHourRow[],
+): string {
+  const summaryRows = summary
+    .map(
+      (row) => `<tr>
+  <td>${escapeHtml(eventLabel(row.event))}</td>
+  <td>${escapeHtml(tagLabel(row.event, row.tag))}</td>
+  <td class="num">${row.last24h}</td>
+  <td class="num">${row.last7d}</td>
+  <td class="num">${row.last30d}</td>
+</tr>`,
+    )
+    .join("");
+
+  const dailyRows = pivotDaily(daily)
+    .map(
+      (row) => `<tr>
+  <td>${escapeHtml(row.day)}</td>
+  <td class="num">${row.loginCta}</td>
+  <td class="num">${row.loginExpired}</td>
+  <td class="num">${row.deployView}</td>
+  <td class="num">${row.conversion}</td>
+  <td class="num">${row.deploySubmit}</td>
+  <td class="num">${row.deploySuccess}</td>
+  <td class="num">${row.successRate}</td>
+</tr>`,
+    )
+    .join("");
+
+  const countryRows = byCountry
+    .map(
+      (row) => `<tr>
+  <td>${escapeHtml(row.country)}</td>
+  <td class="num">${row.hits}</td>
+</tr>`,
+    )
+    .join("");
+
+  const hourRows = fillHours(byHour)
+    .map(
+      (row) => `<tr>
+  <td>${String(row.hour).padStart(2, "0")}:00 UTC</td>
+  <td class="num">${row.hits}</td>
+</tr>`,
+    )
+    .join("");
+
+  return `<p class="eyebrow">Metrics</p>
+<h1 class="page-title">Login &amp; deploy funnel</h1>
+<p class="prose">Server-recorded events from Workers Analytics Engine. Counts are approximate and can take a few minutes to appear after each event.</p>
+<section class="section">
+  <h2>Summary</h2>
+  <table class="metrics-table">
+    <thead><tr><th>Event</th><th>Detail</th><th class="num">24h</th><th class="num">7d</th><th class="num">30d</th></tr></thead>
+    <tbody>${summaryRows || `<tr><td colspan="5">No events recorded yet.</td></tr>`}</tbody>
+  </table>
+</section>
+<section class="section">
+  <h2>Daily, last 14 days</h2>
+  <table class="metrics-table">
+    <thead><tr><th>Day</th><th class="num">Login button clicks</th><th class="num">Login via expired session</th><th class="num">Deploy page views</th><th class="num">Click &rarr; deploy</th><th class="num">Deploy submitted</th><th class="num">Deploy succeeded</th><th class="num">Submit &rarr; success</th></tr></thead>
+    <tbody>${dailyRows || `<tr><td colspan="8">No events recorded yet.</td></tr>`}</tbody>
+  </table>
+</section>
+<section class="section">
+  <h2>By country, last 30 days</h2>
+  <p class="prose">Country-level only, from Cloudflare's edge geolocation. No IP addresses or finer location data are stored.</p>
+  <table class="metrics-table">
+    <thead><tr><th>Country</th><th class="num">Events</th></tr></thead>
+    <tbody>${countryRows || `<tr><td colspan="2">No events recorded yet.</td></tr>`}</tbody>
+  </table>
+</section>
+<section class="section">
+  <h2>By hour of day, last 30 days</h2>
+  <table class="metrics-table">
+    <thead><tr><th>Hour</th><th class="num">Events</th></tr></thead>
+    <tbody>${hourRows}</tbody>
+  </table>
+</section>`;
+}
+
+function fillHours(byHour: MetricsHourRow[]): MetricsHourRow[] {
+  const hits = new Map(byHour.map((row) => [row.hour, row.hits]));
+  return Array.from({ length: 24 }, (_, hour) => ({ hour, hits: hits.get(hour) ?? 0 }));
+}
+
+function eventLabel(event: string): string {
+  switch (event) {
+    case "login_view":
+      return "Login view";
+    case "deploy_view":
+      return "Deploy page view";
+    case "deploy_submit":
+      return "Deploy submitted";
+    case "deploy_success":
+      return "Deploy succeeded";
+    default:
+      return event;
+  }
+}
+
+function tagLabel(event: string, tag: string): string {
+  if (event === "login_view") {
+    return tag === "session_expired" ? "Redirected (expired session)" : "Button click";
+  }
+  if (event === "deploy_view") {
+    return tag === "has_accounts" ? "Authorized with accounts" : "No accounts authorized";
+  }
+  if (event === "deploy_submit" || event === "deploy_success") {
+    return `Release: ${tag}`;
+  }
+  return tag;
+}
+
+function pivotDaily(rows: MetricsDailyRow[]): Array<{
+  day: string;
+  loginCta: number;
+  loginExpired: number;
+  deployView: number;
+  conversion: string;
+  deploySubmit: number;
+  deploySuccess: number;
+  successRate: string;
+}> {
+  const days = new Map<
+    string,
+    { loginCta: number; loginExpired: number; deployView: number; deploySubmit: number; deploySuccess: number }
+  >();
+  for (const row of rows) {
+    const entry = days.get(row.day) ?? { loginCta: 0, loginExpired: 0, deployView: 0, deploySubmit: 0, deploySuccess: 0 };
+    if (row.event === "login_view" && row.tag === "cta") entry.loginCta += row.hits;
+    else if (row.event === "login_view" && row.tag === "session_expired") entry.loginExpired += row.hits;
+    else if (row.event === "deploy_view") entry.deployView += row.hits;
+    else if (row.event === "deploy_submit") entry.deploySubmit += row.hits;
+    else if (row.event === "deploy_success") entry.deploySuccess += row.hits;
+    days.set(row.day, entry);
+  }
+
+  return [...days.entries()]
+    .sort(([a], [b]) => (a < b ? 1 : -1))
+    .map(([day, entry]) => ({
+      day,
+      loginCta: entry.loginCta,
+      loginExpired: entry.loginExpired,
+      deployView: entry.deployView,
+      conversion: entry.loginCta > 0 ? `${Math.round((entry.deployView / entry.loginCta) * 100)}%` : "—",
+      deploySubmit: entry.deploySubmit,
+      deploySuccess: entry.deploySuccess,
+      successRate: entry.deploySubmit > 0 ? `${Math.round((entry.deploySuccess / entry.deploySubmit) * 100)}%` : "—",
+    }));
 }
 
 function displayAccount(account: Account): string {
