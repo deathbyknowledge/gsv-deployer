@@ -2,7 +2,7 @@ import type { Account, DeployJob } from "./types";
 import { ALL_COMPONENTS } from "./deploy";
 import type { ExistingGsvInstallation, ReleaseOption } from "./deploy";
 import { cloudflareMark, discordIcon, escapeHtml, octocatIcon, xIcon } from "./html";
-import type { MetricsCountryRow, MetricsDailyRow, MetricsHourRow, MetricsSummaryRow } from "./metrics";
+import type { MetricsCountryRow, MetricsDailyRow, MetricsHourRow, MetricsRecentDeployRow, MetricsSummaryRow } from "./metrics";
 
 export function homePage(repoUrl: string): string {
   return `<section class="home-sheet">
@@ -168,7 +168,20 @@ export function metricsPage(
   daily: MetricsDailyRow[],
   byCountry: MetricsCountryRow[],
   byHour: MetricsHourRow[],
+  recentDeploys: MetricsRecentDeployRow[],
 ): string {
+  const recentDeployRows = recentDeploys
+    .map(
+      (row) => `<tr>
+  <td>${escapeHtml(formatMetricsTimestamp(row.lastAt))}</td>
+  <td>${escapeHtml(row.instance)}</td>
+  <td>${escapeHtml(row.account)}</td>
+  <td>${escapeHtml(row.release)}</td>
+  <td>${escapeHtml(deployStatusLabel(row.status))}</td>
+</tr>`,
+    )
+    .join("");
+
   const summaryRows = summary
     .map(
       (row) => `<tr>
@@ -218,6 +231,13 @@ export function metricsPage(
 <h1 class="page-title">Login &amp; deploy funnel</h1>
 <p class="prose">Server-recorded events from Workers Analytics Engine. Counts are approximate and can take a few minutes to appear after each event.</p>
 <section class="section">
+  <h2>Recent deploys</h2>
+  <table class="metrics-table">
+    <thead><tr><th>Time (UTC)</th><th>Instance</th><th>Account</th><th>Release</th><th>Status</th></tr></thead>
+    <tbody>${recentDeployRows || `<tr><td colspan="5">No deploys recorded yet.</td></tr>`}</tbody>
+  </table>
+</section>
+<section class="section">
   <h2>Summary</h2>
   <table class="metrics-table">
     <thead><tr><th>Event</th><th>Detail</th><th class="num">24h</th><th class="num">7d</th><th class="num">30d</th></tr></thead>
@@ -246,6 +266,23 @@ export function metricsPage(
     <tbody>${hourRows}</tbody>
   </table>
 </section>`;
+}
+
+function formatMetricsTimestamp(value: string): string {
+  const date = new Date(value.includes(" ") ? `${value.replace(" ", "T")}Z` : value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toISOString().slice(0, 16).replace("T", " ");
+}
+
+function deployStatusLabel(status: MetricsRecentDeployRow["status"]): string {
+  switch (status) {
+    case "succeeded":
+      return "Succeeded";
+    case "failed":
+      return "Failed";
+    default:
+      return "Running";
+  }
 }
 
 function fillHours(byHour: MetricsHourRow[]): MetricsHourRow[] {

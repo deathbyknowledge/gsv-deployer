@@ -9,6 +9,7 @@ export type AppEnv = {
     GITHUB_TOKEN?: string;
     GSV_REPO_OWNER?: string;
     GSV_REPO_NAME?: string;
+    INTERNAL_IPS?: string;
     METRICS_USER: string;
     METRICS_PASSWORD: string;
     OAUTH_SCOPES: string;

@@ -266,16 +266,19 @@ export async function runDeployJob(
   const logger = new DeployLogger(env, jobId);
   await updateJob(env, jobId, { status: "running" });
 
+  const account = job.options.accountName || job.options.accountId;
+
   try {
     const result = await deployGsv(env, job.options, accessToken, logger);
     await updateJob(env, jobId, { status: "succeeded", result });
-    trackEvent(env, "deploy_success", job.options.version);
+    trackEvent(env, "deploy_success", job.options.version, "", jobId, job.options.instance, account);
     await logger.info("Deployment complete.");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await failActiveJobStep(env, jobId, friendlyErrorDetail(message));
     await logger.error(message);
     await updateJob(env, jobId, { status: "failed", error: message });
+    trackEvent(env, "deploy_failed", job.options.version, "", jobId, job.options.instance, account);
     if (error instanceof Error) throw error;
     throw new Error(message);
   }

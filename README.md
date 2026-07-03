@@ -85,7 +85,7 @@ workflow performs the Cloudflare API calls.
 
 ## Metrics
 
-The Worker writes two funnel events to a Workers Analytics Engine dataset
+The Worker writes funnel events to a Workers Analytics Engine dataset
 (`gsv_deploy_metrics`, binding `METRICS`, created automatically on first
 write — no setup needed):
 
@@ -95,14 +95,31 @@ write — no setup needed):
 - `deploy_view`: recorded on every `GET /deploy` that passes session auth,
   tagged `has_accounts` or `no_accounts` depending on whether Cloudflare
   returned an authorized account for the session.
+- `deploy_submit` / `deploy_success` / `deploy_failed`: recorded server-side
+  when a deploy job is created, and when its Workflow finishes successfully
+  or fails. These carry the job id, instance name, and account so they can be
+  grouped into a per-job "recent deploys" list; this mirrors (and backs) the
+  same-named client-side Zaraz events fired from the job page.
 
 ### Dashboard
 
-`GET /metrics` renders a small built-in dashboard (summary counts for 24h/7d/30d
-plus a 14-day daily breakdown with click-to-deploy conversion) so the team can
-check it in a browser instead of running SQL by hand. It's gated with HTTP
-Basic Auth, not the Cloudflare OAuth session, since anyone can self-authorize
-through `/login` to deploy their own GSV.
+`GET /metrics` renders a small built-in dashboard — a recent-deploys list
+(time, instance, account, release, status), summary counts for 24h/7d/30d,
+a 14-day daily breakdown with click-to-deploy and submit-to-success
+conversion, and breakdowns by country/hour — so the team can check it in a
+browser instead of running SQL by hand. It's gated with HTTP Basic Auth, not
+the Cloudflare OAuth session, since anyone can self-authorize through
+`/login` to deploy their own GSV.
+
+To exclude specific IPs (e.g. the team's own traffic) from every event above,
+set `INTERNAL_IPS` to a comma-separated list of IPs:
+
+```bash
+npx wrangler secret put INTERNAL_IPS
+```
+
+The IP is only ever compared in memory against this list before deciding
+whether to write the event — it's never stored in the metrics dataset.
 
 Setup:
 
