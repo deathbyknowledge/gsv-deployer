@@ -120,7 +120,7 @@ export async function fetchRecentDeploys(env: AppEnv["Bindings"]): Promise<Metri
     release: string;
     succeeded: number | string;
     failed: number | string;
-    last_at: string;
+    last_at: string | number;
   }>(
     env,
     `SELECT blob4 AS job_id,
@@ -129,7 +129,7 @@ export async function fetchRecentDeploys(env: AppEnv["Bindings"]): Promise<Metri
             max(blob2) AS release,
             countIf(blob1 = 'deploy_success') AS succeeded,
             countIf(blob1 = 'deploy_failed') AS failed,
-            toString(max(timestamp)) AS last_at
+            max(timestamp) AS last_at
      FROM gsv_deploy_metrics
      WHERE blob1 IN ('deploy_submit', 'deploy_success', 'deploy_failed') AND blob4 != ''
      GROUP BY job_id
@@ -142,7 +142,7 @@ export async function fetchRecentDeploys(env: AppEnv["Bindings"]): Promise<Metri
     account: row.account || "unknown",
     release: row.release || "unknown",
     status: Number(row.failed) > 0 ? "failed" : Number(row.succeeded) > 0 ? "succeeded" : "running",
-    lastAt: row.last_at,
+    lastAt: String(row.last_at),
   }));
 }
 
