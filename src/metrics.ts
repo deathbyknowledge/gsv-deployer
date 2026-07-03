@@ -124,9 +124,9 @@ export async function fetchRecentDeploys(env: AppEnv["Bindings"]): Promise<Metri
   }>(
     env,
     `SELECT blob4 AS job_id,
-            any(blob5) AS instance,
-            any(blob6) AS account,
-            any(blob2) AS release,
+            max(blob5) AS instance,
+            max(blob6) AS account,
+            max(blob2) AS release,
             countIf(blob1 = 'deploy_success') AS succeeded,
             countIf(blob1 = 'deploy_failed') AS failed,
             toString(max(timestamp)) AS last_at
