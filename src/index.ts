@@ -14,9 +14,10 @@ import {
   fetchMetricsByHour,
   fetchMetricsDaily,
   fetchMetricsSummary,
+  fetchRecentDeploys,
   requestCountry,
   requireMetricsAuth,
-  trackEvent,
+  trackRequestEvent,
 } from "./metrics";
 import type { AppEnv, DeployOptions } from "./types";
 
@@ -63,7 +64,7 @@ app.get("/", async (c) => {
 app.get("/login", (c) => {
   const referer = c.req.header("referer") ?? "";
   const isSessionExpiredRedirect = referer.includes("/deploy") || referer.includes("/jobs/");
-  trackEvent(c.env, "login_view", isSessionExpiredRedirect ? "session_expired" : "cta", requestCountry(c.req.raw));
+  trackRequestEvent(c.env, c.req.raw, "login_view", isSessionExpiredRedirect ? "session_expired" : "cta", requestCountry(c.req.raw));
   return startLogin(c);
 });
 
@@ -80,7 +81,7 @@ app.get("/deploy", async (c) => {
   }
 
   const accounts = await fetchAccounts(session.session.token.access_token);
-  trackEvent(c.env, "deploy_view", accounts.length > 0 ? "has_accounts" : "no_accounts", requestCountry(c.req.raw));
+  trackRequestEvent(c.env, c.req.raw, "deploy_view", accounts.length > 0 ? "has_accounts" : "no_accounts", requestCountry(c.req.raw));
   const [releases, installations] = await Promise.all([
     fetchReleaseOptions(c.env).catch(() => []),
     findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []),
@@ -125,7 +126,16 @@ app.post("/deploy", async (c) => {
   };
 
   const job = await createJob(c.env, current.sessionId, options);
-  trackEvent(c.env, "deploy_submit", options.version, requestCountry(c.req.raw));
+  trackRequestEvent(
+    c.env,
+    c.req.raw,
+    "deploy_submit",
+    options.version,
+    requestCountry(c.req.raw),
+    job.id,
+    options.instance,
+    options.accountName || options.accountId,
+  );
   await storeDeployToken(c.env, job.id, current.session.token.access_token);
   try {
     const instance = await c.env.DEPLOY_WORKFLOW.create({
@@ -187,13 +197,18 @@ app.get("/metrics", async (c) => {
   if (denied) return denied;
 
   try {
-    const [summary, daily, byCountry, byHour] = await Promise.all([
+    const [summary, daily, byCountry, byHour, recentDeploys] = await Promise.all([
       fetchMetricsSummary(c.env),
       fetchMetricsDaily(c.env),
       fetchMetricsByCountry(c.env),
       fetchMetricsByHour(c.env),
+      fetchRecentDeploys(c.env),
     ]);
-    return page(c, { title: "Metrics", body: metricsPage(summary, daily, byCountry, byHour), width: "wide" });
+    return page(c, {
+      title: "Metrics",
+      body: metricsPage(summary, daily, byCountry, byHour, recentDeploys),
+      width: "wide",
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return page(c, {

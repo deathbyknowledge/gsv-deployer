@@ -17,6 +17,24 @@ export function trackEvent(env: AppEnv["Bindings"], event: string, ...blobs: str
   }
 }
 
+// Skips events entirely for requests from an allowlisted internal IP (e.g. founders' own
+// traffic), so it never inflates the funnel numbers. The IP itself is only compared in
+// memory for this check and is never written to the metrics dataset.
+export function trackRequestEvent(env: AppEnv["Bindings"], request: Request, event: string, ...blobs: string[]): void {
+  if (isInternalRequest(env, request)) return;
+  trackEvent(env, event, ...blobs);
+}
+
+function isInternalRequest(env: AppEnv["Bindings"], request: Request): boolean {
+  if (!env.INTERNAL_IPS) return false;
+  const ip = request.headers.get("cf-connecting-ip");
+  if (!ip) return false;
+  return env.INTERNAL_IPS.split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .includes(ip);
+}
+
 export function requestCountry(request: Request): string {
   const cf = request.cf as IncomingRequestCfProperties | undefined;
   return cf?.country ?? "unknown";
@@ -83,6 +101,49 @@ export async function fetchMetricsByHour(env: AppEnv["Bindings"]): Promise<Metri
      ORDER BY hour`,
   );
   return rows.map((row) => ({ hour: Number(row.hour), hits: Number(row.hits) }));
+}
+
+export type MetricsRecentDeployRow = {
+  jobId: string;
+  instance: string;
+  account: string;
+  release: string;
+  status: "running" | "succeeded" | "failed";
+  lastAt: string;
+};
+
+export async function fetchRecentDeploys(env: AppEnv["Bindings"]): Promise<MetricsRecentDeployRow[]> {
+  const rows = await runAnalyticsQuery<{
+    job_id: string;
+    instance: string;
+    account: string;
+    release: string;
+    succeeded: number | string;
+    failed: number | string;
+    last_at: string;
+  }>(
+    env,
+    `SELECT blob4 AS job_id,
+            any(blob5) AS instance,
+            any(blob6) AS account,
+            any(blob2) AS release,
+            countIf(blob1 = 'deploy_success') AS succeeded,
+            countIf(blob1 = 'deploy_failed') AS failed,
+            toString(max(timestamp)) AS last_at
+     FROM gsv_deploy_metrics
+     WHERE blob1 IN ('deploy_submit', 'deploy_success', 'deploy_failed') AND blob4 != ''
+     GROUP BY job_id
+     ORDER BY last_at DESC
+     LIMIT 20`,
+  );
+  return rows.map((row) => ({
+    jobId: row.job_id,
+    instance: row.instance || "unknown",
+    account: row.account || "unknown",
+    release: row.release || "unknown",
+    status: Number(row.failed) > 0 ? "failed" : Number(row.succeeded) > 0 ? "succeeded" : "running",
+    lastAt: row.last_at,
+  }));
 }
 
 async function runAnalyticsQuery<T>(env: AppEnv["Bindings"], sql: string): Promise<T[]> {
