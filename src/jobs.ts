@@ -3,6 +3,70 @@ import { randomToken } from "./oauth";
 
 const JOB_TTL_SECONDS = 24 * 60 * 60;
 const DEPLOY_TOKEN_TTL_SECONDS = 2 * 60 * 60;
+const JOB_FLUSH_INTERVAL_MS = 1_100;
+const JOB_SAVE_RETRY_DELAYS_MS = [1_100, 1_500, 2_500, 4_000];
+
+type FlushOptions = {
+  flush?: boolean;
+};
+
+export class DeployJobWriter {
+  private dirty = false;
+  private lastFlushAt = 0;
+
+  private constructor(
+    private readonly env: AppEnv["Bindings"],
+    readonly job: DeployJob,
+  ) {}
+
+  static async load(env: AppEnv["Bindings"], jobId: string): Promise<DeployJobWriter | null> {
+    const job = await getJob(env, jobId);
+    return job ? new DeployJobWriter(env, job) : null;
+  }
+
+  async appendLog(level: "info" | "warning" | "error", message: string, options?: FlushOptions): Promise<void> {
+    appendLogToJob(this.job, level, message);
+    await this.markDirty(options);
+  }
+
+  async update(patch: Partial<DeployJob>, options?: FlushOptions): Promise<void> {
+    Object.assign(this.job, patch);
+    await this.markDirty(options);
+  }
+
+  async updateStep(
+    stepId: DeployStepId,
+    status: DeployStepStatus,
+    detail?: string,
+    options?: FlushOptions,
+  ): Promise<void> {
+    updateStepOnJob(this.job, stepId, status, detail);
+    await this.markDirty(options);
+  }
+
+  async failActiveStep(detail: string, options?: FlushOptions): Promise<void> {
+    failActiveStepOnJob(this.job, detail);
+    await this.markDirty(options);
+  }
+
+  async flush(force = false): Promise<void> {
+    if (!this.dirty && !force) return;
+    await saveJob(this.env, this.job);
+    this.dirty = false;
+    this.lastFlushAt = Date.now();
+  }
+
+  private async markDirty(options?: FlushOptions): Promise<void> {
+    this.dirty = true;
+    if (options?.flush === false) return;
+    await this.flushIfDue();
+  }
+
+  private async flushIfDue(): Promise<void> {
+    if (Date.now() - this.lastFlushAt < JOB_FLUSH_INTERVAL_MS) return;
+    await this.flush();
+  }
+}
 
 export async function createJob(
   env: AppEnv["Bindings"],
@@ -39,9 +103,7 @@ export async function getJob(
 
 export async function saveJob(env: AppEnv["Bindings"], job: DeployJob): Promise<void> {
   job.updatedAt = Date.now();
-  await env.SESSIONS.put(jobKey(job.id), JSON.stringify(job), {
-    expirationTtl: JOB_TTL_SECONDS,
-  });
+  await putJobWithRetry(env, job);
 }
 
 export async function appendLog(
@@ -52,8 +114,7 @@ export async function appendLog(
 ): Promise<void> {
   const job = await getJob(env, jobId);
   if (!job) return;
-  job.logs.push({ at: Date.now(), level, message });
-  if (job.logs.length > 300) job.logs.splice(0, job.logs.length - 300);
+  appendLogToJob(job, level, message);
   await saveJob(env, job);
 }
 
@@ -77,11 +138,7 @@ export async function updateJobStep(
 ): Promise<void> {
   const job = await getJob(env, jobId);
   if (!job) return;
-  const step = job.steps.find((item) => item.id === stepId);
-  if (!step) return;
-  step.status = status;
-  step.updatedAt = Date.now();
-  if (detail !== undefined) step.detail = detail;
+  updateStepOnJob(job, stepId, status, detail);
   await saveJob(env, job);
 }
 
@@ -92,13 +149,69 @@ export async function failActiveJobStep(
 ): Promise<void> {
   const job = await getJob(env, jobId);
   if (!job) return;
+  failActiveStepOnJob(job, detail);
+  await saveJob(env, job);
+}
+
+function appendLogToJob(job: DeployJob, level: "info" | "warning" | "error", message: string): void {
+  job.logs.push({ at: Date.now(), level, message });
+  if (job.logs.length > 300) job.logs.splice(0, job.logs.length - 300);
+}
+
+function updateStepOnJob(
+  job: DeployJob,
+  stepId: DeployStepId,
+  status: DeployStepStatus,
+  detail?: string,
+): void {
+  const step = job.steps.find((item) => item.id === stepId);
+  if (!step) return;
+  step.status = status;
+  step.updatedAt = Date.now();
+  if (detail !== undefined) step.detail = detail;
+}
+
+function failActiveStepOnJob(job: DeployJob, detail: string): void {
   const running = job.steps.find((step) => step.status === "running");
   const target = running ?? job.steps.find((step) => step.status === "pending") ?? job.steps.at(-1);
   if (!target) return;
   target.status = "failed";
   target.detail = detail;
   target.updatedAt = Date.now();
-  await saveJob(env, job);
+}
+
+async function putJobWithRetry(env: AppEnv["Bindings"], job: DeployJob): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= JOB_SAVE_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      job.updatedAt = Date.now();
+      await env.SESSIONS.put(jobKey(job.id), JSON.stringify(job), {
+        expirationTtl: JOB_TTL_SECONDS,
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableKvPutError(error) || attempt === JOB_SAVE_RETRY_DELAYS_MS.length) break;
+      await sleep(JOB_SAVE_RETRY_DELAYS_MS[attempt] + retryJitterMs(250));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function isRetryableKvPutError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:429|too many requests|rate limit|temporar(?:y|ily)|internal error)/i.test(message);
+}
+
+function retryJitterMs(maxMs: number): number {
+  const value = new Uint32Array(1);
+  crypto.getRandomValues(value);
+  return value[0] % (maxMs + 1);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function storeDeployToken(

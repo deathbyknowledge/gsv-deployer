@@ -1,9 +1,10 @@
 import { blake3 } from "@noble/hashes/blake3.js";
+import type { WorkflowStep } from "cloudflare:workers";
 import { parse as parseJsonc } from "jsonc-parser";
 import { ungzip } from "pako";
 import { parse as parseToml } from "smol-toml";
 
-import { appendLog, failActiveJobStep, getJob, updateJob, updateJobStep } from "./jobs";
+import { deleteDeployToken, DeployJobWriter, getDeployToken } from "./jobs";
 import { trackEvent } from "./metrics";
 import type { Account, AppEnv, DeployOptions, DeployStepId, DeployStepStatus } from "./types";
 
@@ -25,6 +26,14 @@ const SCRIPT_CHANNEL_DISCORD = "gsv-channel-discord";
 const SCRIPT_CHANNEL_TELEGRAM = "gsv-channel-telegram";
 const WORKERS_SUBDOMAIN_API_DATE = "2025-08-01";
 const MAX_SOURCE_MAP_UPLOAD_BYTES = 2 * 1024 * 1024;
+const DEPLOY_WORKFLOW_STEP_CONFIG = {
+  timeout: "30 minutes",
+  retries: { limit: 2, delay: "30 seconds", backoff: "linear" },
+} as const;
+const CLEANUP_WORKFLOW_STEP_CONFIG = {
+  timeout: "2 minutes",
+  retries: { limit: 3, delay: "10 seconds", backoff: "linear" },
+} as const;
 
 export const ALL_COMPONENTS = [
   COMPONENT_RIPGIT,
@@ -174,26 +183,59 @@ type TarEntry = {
   bytes: Uint8Array;
 };
 
+type InfoLogger = {
+  info(message: string): Promise<void>;
+};
+
+type DeploymentPlan = {
+  repoOwner: string;
+  repoName: string;
+  version: string;
+  instance: DeployInstance;
+  components: string[];
+};
+
+type DeploymentPreflight = {
+  existingScriptsWithMigrations: Array<[string, string | null]>;
+  accountSubdomain: string | null;
+};
+
+type DeploymentWorkersState = {
+  availableScripts: string[];
+};
+
+type DeploymentResult = {
+  version: string;
+  gatewayUrl?: string;
+};
+
+type DeploymentPhase = {
+  accessToken: string;
+  writer: DeployJobWriter;
+  logger: DeployLogger;
+};
+
+const SILENT_LOGGER: InfoLogger = {
+  async info() {},
+};
+
 class DeployLogger {
-  constructor(
-    private readonly env: AppEnv["Bindings"],
-    private readonly jobId: string,
-  ) {}
+  constructor(private readonly writer: DeployJobWriter) {}
 
   info(message: string): Promise<void> {
-    return appendLog(this.env, this.jobId, "info", message);
+    return this.writer.appendLog("info", message);
   }
 
   warning(message: string): Promise<void> {
-    return appendLog(this.env, this.jobId, "warning", message);
+    return this.writer.appendLog("warning", message);
   }
 
   error(message: string): Promise<void> {
-    return appendLog(this.env, this.jobId, "error", message);
+    return this.writer.appendLog("error", message);
   }
 
   step(stepId: DeployStepId, status: DeployStepStatus, detail?: string): Promise<void> {
-    return updateJobStep(this.env, this.jobId, stepId, status, detail);
+    return this.writer.updateStep(stepId, status, detail);
   }
 }
 
@@ -260,36 +302,122 @@ export async function runDeployJob(
   jobId: string,
   accessToken: string,
 ): Promise<void> {
-  const job = await getJob(env, jobId);
-  if (!job) return;
-
-  const logger = new DeployLogger(env, jobId);
-  await updateJob(env, jobId, { status: "running" });
-
-  const account = job.options.accountName || job.options.accountId;
+  const writer = await DeployJobWriter.load(env, jobId);
+  if (!writer) return;
 
   try {
-    const result = await deployGsv(env, job.options, accessToken, logger);
-    await updateJob(env, jobId, { status: "succeeded", result });
-    trackEvent(env, "deploy_success", job.options.version, "", jobId, job.options.instance, account);
-    await logger.info("Deployment complete.");
+    const logger = new DeployLogger(writer);
+    await writer.update({ status: "running" }, { flush: false });
+    const plan = await prepareDeploymentPlan(env, writer.job.options, logger);
+    const preflight = await inspectDeploymentTarget(accessToken, writer.job.options.accountId, plan, logger);
+    const workers = await deployWorkerScripts(accessToken, writer.job.options.accountId, plan, preflight, logger);
+    await finalizeWorkerBindings(accessToken, writer.job.options.accountId, plan, preflight, workers, logger);
+    const result = await configureAdaptersAndFinish(accessToken, writer.job.options, plan, preflight, logger);
+    await recordDeploymentSuccess(env, writer, result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await failActiveJobStep(env, jobId, friendlyErrorDetail(message));
-    await logger.error(message);
-    await updateJob(env, jobId, { status: "failed", error: message });
-    trackEvent(env, "deploy_failed", job.options.version, "", jobId, job.options.instance, account);
+    await recordDeploymentFailureWithWriter(env, writer, error);
     if (error instanceof Error) throw error;
-    throw new Error(message);
+    throw new Error(String(error));
+  } finally {
+    await writer.flush();
   }
 }
 
-async function deployGsv(
+export async function runDeployWorkflow(
+  env: AppEnv["Bindings"],
+  jobId: string,
+  step: WorkflowStep,
+): Promise<void> {
+  try {
+    const plan = await step.do("prepare deployment", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, async ({ writer, logger }) => {
+        await writer.update({ status: "running" }, { flush: false });
+        return prepareDeploymentPlan(env, writer.job.options, logger);
+      }),
+    );
+    if (!plan) return;
+
+    const preflight = await step.do("inspect target and ensure storage", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, ({ accessToken, writer, logger }) =>
+        inspectDeploymentTarget(accessToken, writer.job.options.accountId, plan, logger),
+      ),
+    );
+    if (!preflight) return;
+
+    const workers = await step.do("deploy worker scripts", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, ({ accessToken, writer, logger }) =>
+        deployWorkerScripts(accessToken, writer.job.options.accountId, plan, preflight, logger),
+      ),
+    );
+    if (!workers) return;
+
+    const bindingsFinalized = await step.do("finalize worker bindings", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
+        await finalizeWorkerBindings(accessToken, writer.job.options.accountId, plan, preflight, workers, logger);
+        return { ok: true };
+      }),
+    );
+    if (!bindingsFinalized) return;
+
+    await step.do("configure adapters and finish", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
+        const result = await configureAdaptersAndFinish(accessToken, writer.job.options, plan, preflight, logger);
+        await recordDeploymentSuccess(env, writer, result);
+        return result;
+      }),
+    );
+  } catch (error) {
+    await step.do("record deployment failure", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
+      await recordDeploymentFailure(env, jobId, error);
+      return { ok: true };
+    });
+    if (error instanceof Error) throw error;
+    throw new Error(String(error));
+  } finally {
+    try {
+      await step.do("cleanup deployment credentials", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
+        await deleteDeployToken(env, jobId);
+        return { ok: true };
+      });
+    } catch {
+      // The deploy token also has a short TTL; cleanup should not mask the deployment result.
+    }
+  }
+}
+
+async function withDeploymentPhase<T>(
+  env: AppEnv["Bindings"],
+  jobId: string,
+  callback: (phase: DeploymentPhase) => Promise<T>,
+): Promise<T | null> {
+  const phase = await loadDeploymentPhase(env, jobId);
+  if (!phase) return null;
+  try {
+    return await callback(phase);
+  } finally {
+    await phase.writer.flush();
+  }
+}
+
+async function loadDeploymentPhase(env: AppEnv["Bindings"], jobId: string): Promise<DeploymentPhase | null> {
+  const writer = await DeployJobWriter.load(env, jobId);
+  if (!writer) return null;
+
+  const accessToken = await getDeployToken(env, jobId);
+  if (!accessToken) {
+    const message = "Deployment credentials expired before the workflow started. Please authorize Cloudflare again.";
+    await recordDeploymentFailureWithWriter(env, writer, message);
+    throw new Error(message);
+  }
+
+  return { accessToken, writer, logger: new DeployLogger(writer) };
+}
+
+async function prepareDeploymentPlan(
   env: AppEnv["Bindings"],
   options: DeployOptions,
-  accessToken: string,
   logger: DeployLogger,
-): Promise<{ version: string; gatewayUrl?: string }> {
+): Promise<DeploymentPlan> {
   const instance = parseInstance(options.instance);
   const components = normalizeComponents(options.components).sort((a, b) => deployOrder(a) - deployOrder(b));
   if (components.length === 0) throw new Error("No components selected.");
@@ -302,15 +430,23 @@ async function deployGsv(
   await logger.info(`Preparing ${components.join(", ")} from ${version}.`);
 
   await logger.step("prepare", "running", `Downloading and verifying ${formatCount(components.length, "component")}.`);
-  const prepared = await prepareBundles(repoOwner, repoName, version, components, instance, logger);
+  await prepareBundles(repoOwner, repoName, version, components, instance, logger);
   await logger.step("prepare", "complete", "GSV components are verified and ready.");
 
-  const selectedComponents = new Set(components);
-  const gatewayScriptName = scriptNameForComponent(instance, COMPONENT_GATEWAY);
-  const ripgitScriptName = scriptNameForComponent(instance, COMPONENT_RIPGIT);
-  const assemblerScriptName = scriptNameForComponent(instance, COMPONENT_ASSEMBLER);
+  return { repoOwner, repoName, version, instance, components };
+}
 
-  const existingScriptsWithMigrations = await listWorkerScripts(accessToken, options.accountId);
+async function inspectDeploymentTarget(
+  accessToken: string,
+  accountId: string,
+  plan: DeploymentPlan,
+  logger: DeployLogger,
+): Promise<DeploymentPreflight> {
+  const selectedComponents = new Set(plan.components);
+  const ripgitScriptName = scriptNameForComponent(plan.instance, COMPONENT_RIPGIT);
+  const assemblerScriptName = scriptNameForComponent(plan.instance, COMPONENT_ASSEMBLER);
+
+  const existingScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
   const existingScripts = new Set([...existingScriptsWithMigrations.keys()]);
 
   if (selectedComponents.has(COMPONENT_GATEWAY) && !selectedComponents.has(COMPONENT_RIPGIT) && !existingScripts.has(ripgitScriptName)) {
@@ -321,22 +457,39 @@ async function deployGsv(
   }
 
   await logger.step("storage", "running", "Checking Cloudflare storage resources.");
-  await ensureStorageResources(accessToken, options.accountId, prepared, logger);
+  const prepared = await prepareBundlesForPhase(plan, logger, "Loading verified bundles for storage checks.");
+  await ensureStorageResources(accessToken, accountId, prepared, logger);
   await logger.step("storage", "complete", "Storage resources are ready.");
 
-  const accountSubdomain = await fetchAccountWorkersSubdomain(accessToken, options.accountId, logger);
-  const uploadedAssetsByScript = new Map<string, UploadedAssets>();
-  const availableScripts = new Set(existingScripts);
+  const accountSubdomain = await fetchAccountWorkersSubdomain(accessToken, accountId, logger);
+  return { existingScriptsWithMigrations: [...existingScriptsWithMigrations], accountSubdomain };
+}
+
+async function deployWorkerScripts(
+  accessToken: string,
+  accountId: string,
+  plan: DeploymentPlan,
+  preflight: DeploymentPreflight,
+  logger: DeployLogger,
+): Promise<DeploymentWorkersState> {
+  const prepared = await prepareBundlesForPhase(plan, logger, "Loading verified bundles for Worker upload.");
+  const selectedComponents = new Set(plan.components);
+  const currentScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
+  const existingScriptsWithMigrations = new Map([
+    ...preflight.existingScriptsWithMigrations,
+    ...currentScriptsWithMigrations,
+  ]);
+  const accountSubdomain = preflight.accountSubdomain;
+  const availableScripts = new Set(existingScriptsWithMigrations.keys());
 
   await logger.step("workers", "running", `Uploading ${formatCount(prepared.length, "Worker")}.`);
   await logger.info("Deploying workers (pass 1/2).");
   for (const bundle of prepared) {
     await logger.info(`Deploying ${bundle.component} (${bundle.scriptName}).`);
-    const uploadedAssets = await syncAssetsForBundle(accessToken, options.accountId, bundle, logger);
-    if (uploadedAssets) uploadedAssetsByScript.set(bundle.scriptName, uploadedAssets);
+    const uploadedAssets = await syncAssetsForBundle(accessToken, accountId, bundle, logger);
 
-    const metadata = await buildUploadMetadata(accessToken, options.accountId, bundle, {
-      instance,
+    const metadata = await buildUploadMetadata(accessToken, accountId, bundle, {
+      instance: plan.instance,
       selectedComponents,
       availableScripts,
       accountSubdomain,
@@ -347,19 +500,35 @@ async function deployGsv(
       keepAssets: false,
       logger,
     });
-    await uploadWorkerScript(accessToken, options.accountId, bundle, metadata, false);
+    await uploadWorkerScript(accessToken, accountId, bundle, metadata, false);
     await logger.info(`Uploaded ${bundle.scriptName}.`);
     availableScripts.add(bundle.scriptName);
-    await enableWorkersDev(accessToken, options.accountId, bundle.scriptName, logger);
+    await enableWorkersDev(accessToken, accountId, bundle.scriptName, logger);
   }
   await logger.step("workers", "complete", "Workers and assets are deployed.");
+
+  return { availableScripts: [...availableScripts].sort() };
+}
+
+async function finalizeWorkerBindings(
+  accessToken: string,
+  accountId: string,
+  plan: DeploymentPlan,
+  preflight: DeploymentPreflight,
+  workers: DeploymentWorkersState,
+  logger: DeployLogger,
+): Promise<void> {
+  const prepared = await prepareBundlesForPhase(plan, logger, "Loading verified bundles for binding finalization.");
+  const selectedComponents = new Set(plan.components);
+  const availableScripts = new Set(workers.availableScripts);
+  const accountSubdomain = preflight.accountSubdomain;
 
   await logger.step("bindings", "running", "Connecting GSV services.");
   await logger.info("Finalizing service bindings (pass 2/2).");
   for (const bundle of prepared) {
     await logger.info(`Finalizing ${bundle.component} (${bundle.scriptName}).`);
-    const metadata = await buildUploadMetadata(accessToken, options.accountId, bundle, {
-      instance,
+    const metadata = await buildUploadMetadata(accessToken, accountId, bundle, {
+      instance: plan.instance,
       selectedComponents,
       availableScripts,
       accountSubdomain,
@@ -370,10 +539,22 @@ async function deployGsv(
       keepAssets: hasAssets(bundle),
       logger,
     });
-    await uploadWorkerScript(accessToken, options.accountId, bundle, metadata, true);
+    await uploadWorkerScript(accessToken, accountId, bundle, metadata, true);
     await logger.info(`Updated bindings for ${bundle.scriptName}.`);
   }
   await logger.step("bindings", "complete", "GSV services are connected.");
+}
+
+async function configureAdaptersAndFinish(
+  accessToken: string,
+  options: DeployOptions,
+  plan: DeploymentPlan,
+  preflight: DeploymentPreflight,
+  logger: DeployLogger,
+): Promise<DeploymentResult> {
+  const selectedComponents = new Set(plan.components);
+  const accountSubdomain = preflight.accountSubdomain;
+  const gatewayScriptName = scriptNameForComponent(plan.instance, COMPONENT_GATEWAY);
 
   const hasChannelComponents = [...selectedComponents].some((component) => component.startsWith("channel-"));
   if (hasChannelComponents) {
@@ -384,7 +565,7 @@ async function deployGsv(
     await setWorkerSecret(
       accessToken,
       options.accountId,
-      scriptNameForComponent(instance, COMPONENT_CHANNEL_DISCORD),
+      scriptNameForComponent(plan.instance, COMPONENT_CHANNEL_DISCORD),
       "DISCORD_BOT_TOKEN",
       options.discordBotToken,
     );
@@ -397,7 +578,7 @@ async function deployGsv(
     await setWorkerSecret(
       accessToken,
       options.accountId,
-      scriptNameForComponent(instance, COMPONENT_CHANNEL_TELEGRAM),
+      scriptNameForComponent(plan.instance, COMPONENT_CHANNEL_TELEGRAM),
       "TELEGRAM_BOT_TOKEN",
       options.telegramBotToken,
     );
@@ -432,7 +613,52 @@ async function deployGsv(
         : "Selected components are deployed.",
   );
 
-  return { version, gatewayUrl };
+  return { version: plan.version, gatewayUrl };
+}
+
+async function prepareBundlesForPhase(
+  plan: DeploymentPlan,
+  logger: DeployLogger,
+  message: string,
+): Promise<PreparedBundle[]> {
+  await logger.info(message);
+  return prepareBundles(plan.repoOwner, plan.repoName, plan.version, plan.components, plan.instance, SILENT_LOGGER);
+}
+
+async function recordDeploymentSuccess(
+  env: AppEnv["Bindings"],
+  writer: DeployJobWriter,
+  result: DeploymentResult,
+): Promise<void> {
+  const account = writer.job.options.accountName || writer.job.options.accountId;
+  await writer.update({ status: "succeeded", result }, { flush: false });
+  await writer.appendLog("info", "Deployment complete.", { flush: false });
+  trackEvent(env, "deploy_success", writer.job.options.version, "", writer.job.id, writer.job.options.instance, account);
+  await writer.flush(true);
+}
+
+async function recordDeploymentFailure(env: AppEnv["Bindings"], jobId: string, error: unknown): Promise<void> {
+  const writer = await DeployJobWriter.load(env, jobId);
+  if (!writer) return;
+  await recordDeploymentFailureWithWriter(env, writer, error);
+}
+
+async function recordDeploymentFailureWithWriter(
+  env: AppEnv["Bindings"],
+  writer: DeployJobWriter,
+  error: unknown,
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  if (writer.job.status === "failed" && writer.job.error === message) {
+    return;
+  }
+
+  const account = writer.job.options.accountName || writer.job.options.accountId;
+  await writer.failActiveStep(friendlyErrorDetail(message), { flush: false });
+  await writer.appendLog("error", message, { flush: false });
+  await writer.update({ status: "failed", error: message }, { flush: false });
+  trackEvent(env, "deploy_failed", writer.job.options.version, "", writer.job.id, writer.job.options.instance, account);
+  await writer.flush(true);
 }
 
 function normalizeComponents(raw: string[]): string[] {
@@ -653,7 +879,7 @@ async function resolveReleaseTag(
   repoOwner: string,
   repoName: string,
   version: string,
-  logger: DeployLogger,
+  logger: InfoLogger,
 ): Promise<string> {
   const normalized = version.trim().toLowerCase() || "latest";
   if (normalized === "latest" || normalized === "stable") {
@@ -735,7 +961,7 @@ async function prepareBundles(
   version: string,
   components: string[],
   instance: DeployInstance,
-  logger: DeployLogger,
+  logger: InfoLogger,
 ): Promise<PreparedBundle[]> {
   const checksumsUrl = releaseDownloadUrl(repoOwner, repoName, version, BUNDLE_CHECKSUMS);
   await logger.info(`Fetching checksums from ${checksumsUrl}.`);
