@@ -2,7 +2,8 @@ import type { AppEnv, DeployJob, DeployOptions, DeployStep, DeployStepId, Deploy
 import { randomToken } from "./oauth";
 
 const JOB_TTL_SECONDS = 24 * 60 * 60;
-const DEPLOY_TOKEN_TTL_SECONDS = 2 * 60 * 60;
+// Covers the split Workflow retry envelope; the browser session can expire while deployment continues.
+const DEPLOY_TOKEN_TTL_SECONDS = 10 * 60 * 60;
 const JOB_FLUSH_INTERVAL_MS = 1_100;
 const JOB_SAVE_RETRY_DELAYS_MS = [1_100, 1_500, 2_500, 4_000];
 
@@ -51,13 +52,17 @@ export class DeployJobWriter {
 
   async flush(force = false): Promise<void> {
     if (!this.dirty && !force) return;
-    await saveJob(this.env, this.job);
+    const latest = await getJob(this.env, this.job.id);
+    const job = mergeJobForSave(latest, this.job);
+    await saveJob(this.env, job);
+    Object.assign(this.job, job);
     this.dirty = false;
     this.lastFlushAt = Date.now();
   }
 
   private async markDirty(options?: FlushOptions): Promise<void> {
     this.dirty = true;
+    this.job.updatedAt = Date.now();
     if (options?.flush === false) return;
     await this.flushIfDue();
   }
@@ -178,6 +183,46 @@ function failActiveStepOnJob(job: DeployJob, detail: string): void {
   target.status = "failed";
   target.detail = detail;
   target.updatedAt = Date.now();
+}
+
+function mergeJobForSave(latest: DeployJob | null, pending: DeployJob): DeployJob {
+  if (!latest) return pending;
+  return {
+    ...latest,
+    ...pending,
+    steps: mergeSteps(latest.steps, pending.steps),
+    logs: mergeLogs(latest.logs, pending.logs),
+  };
+}
+
+function mergeSteps(latest: DeployStep[], pending: DeployStep[]): DeployStep[] {
+  const latestById = new Map(latest.map((step) => [step.id, step]));
+  const merged = pending.map((step) => {
+    const current = latestById.get(step.id);
+    if (!current) return step;
+    return (current.updatedAt ?? 0) > (step.updatedAt ?? 0) ? current : step;
+  });
+  const seen = new Set(merged.map((step) => step.id));
+  for (const step of latest) {
+    if (!seen.has(step.id)) merged.push(step);
+  }
+  return merged;
+}
+
+function mergeLogs(
+  latest: DeployJob["logs"],
+  pending: DeployJob["logs"],
+): DeployJob["logs"] {
+  const seen = new Set<string>();
+  const merged: DeployJob["logs"] = [];
+  for (const log of [...latest, ...pending].sort((a, b) => a.at - b.at)) {
+    const key = `${log.at}:${log.level}:${log.message}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(log);
+  }
+  if (merged.length > 300) merged.splice(0, merged.length - 300);
+  return merged;
 }
 
 async function putJobWithRetry(env: AppEnv["Bindings"], job: DeployJob): Promise<void> {

@@ -17,6 +17,16 @@ npx wrangler kv namespace create SESSIONS
 Copy the namespace ID into `wrangler.jsonc`, replacing
 `replace-with-kv-namespace-id`.
 
+Create an R2 bucket for cached GSV release bundles:
+
+```bash
+npx wrangler r2 bucket create gsv-deployment-release-cache
+```
+
+The bucket is bound as `RELEASE_CACHE` in `wrangler.jsonc`. It is used only by
+the installer Worker to avoid repeatedly downloading immutable release assets
+from GitHub.
+
 Create a Cloudflare OAuth client:
 
 - Response type: `code`
