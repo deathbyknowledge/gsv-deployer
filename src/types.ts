@@ -16,6 +16,7 @@ export type AppEnv = {
     OAUTH_TOKEN_AUTH_METHOD: string;
     SESSION_SECRET: string;
     SESSIONS: KVNamespace;
+    RELEASE_CACHE: R2Bucket;
     DEPLOY_WORKFLOW: Workflow<DeployWorkflowParams>;
     METRICS: AnalyticsEngineDataset;
   };

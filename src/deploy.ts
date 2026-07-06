@@ -193,6 +193,7 @@ type DeploymentPlan = {
   version: string;
   instance: DeployInstance;
   components: string[];
+  artifactCachePrefix: string;
 };
 
 type DeploymentPreflight = {
@@ -214,6 +215,10 @@ type DeploymentPhase = {
   writer: DeployJobWriter;
   logger: DeployLogger;
 };
+
+type ReleaseArtifactSource =
+  | { kind: "release"; snapshotPrefix: string }
+  | { kind: "snapshot"; snapshotPrefix: string };
 
 const SILENT_LOGGER: InfoLogger = {
   async info() {},
@@ -304,14 +309,15 @@ export async function runDeployJob(
 ): Promise<void> {
   const writer = await DeployJobWriter.load(env, jobId);
   if (!writer) return;
+  let plan: DeploymentPlan | null = null;
 
   try {
     const logger = new DeployLogger(writer);
     await writer.update({ status: "running" }, { flush: false });
-    const plan = await prepareDeploymentPlan(env, writer.job.options, logger);
-    const preflight = await inspectDeploymentTarget(accessToken, writer.job.options.accountId, plan, logger);
-    const workers = await deployWorkerScripts(accessToken, writer.job.options.accountId, plan, preflight, logger);
-    await finalizeWorkerBindings(accessToken, writer.job.options.accountId, plan, preflight, workers, logger);
+    plan = await prepareDeploymentPlan(env, jobId, writer.job.options, logger);
+    const preflight = await inspectDeploymentTarget(env, accessToken, writer.job.options.accountId, plan, logger);
+    const workers = await deployWorkerScripts(env, accessToken, writer.job.options.accountId, plan, preflight, logger);
+    await finalizeWorkerBindings(env, accessToken, writer.job.options.accountId, plan, preflight, workers, logger);
     const result = await configureAdaptersAndFinish(accessToken, writer.job.options, plan, preflight, logger);
     await recordDeploymentSuccess(env, writer, result);
   } catch (error) {
@@ -320,6 +326,7 @@ export async function runDeployJob(
     throw new Error(String(error));
   } finally {
     await writer.flush();
+    if (plan) await cleanupDeploymentArtifacts(env, plan, SILENT_LOGGER);
   }
 }
 
@@ -328,32 +335,34 @@ export async function runDeployWorkflow(
   jobId: string,
   step: WorkflowStep,
 ): Promise<void> {
+  let plan: DeploymentPlan | null = null;
   try {
-    const plan = await step.do("prepare deployment", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+    plan = await step.do("prepare deployment", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, async ({ writer, logger }) => {
         await writer.update({ status: "running" }, { flush: false });
-        return prepareDeploymentPlan(env, writer.job.options, logger);
+        return prepareDeploymentPlan(env, jobId, writer.job.options, logger);
       }),
     );
     if (!plan) return;
+    const deploymentPlan = plan;
 
     const preflight = await step.do("inspect target and ensure storage", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, ({ accessToken, writer, logger }) =>
-        inspectDeploymentTarget(accessToken, writer.job.options.accountId, plan, logger),
+        inspectDeploymentTarget(env, accessToken, writer.job.options.accountId, deploymentPlan, logger),
       ),
     );
     if (!preflight) return;
 
     const workers = await step.do("deploy worker scripts", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, ({ accessToken, writer, logger }) =>
-        deployWorkerScripts(accessToken, writer.job.options.accountId, plan, preflight, logger),
+        deployWorkerScripts(env, accessToken, writer.job.options.accountId, deploymentPlan, preflight, logger),
       ),
     );
     if (!workers) return;
 
     const bindingsFinalized = await step.do("finalize worker bindings", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
-        await finalizeWorkerBindings(accessToken, writer.job.options.accountId, plan, preflight, workers, logger);
+        await finalizeWorkerBindings(env, accessToken, writer.job.options.accountId, deploymentPlan, preflight, workers, logger);
         return { ok: true };
       }),
     );
@@ -361,7 +370,7 @@ export async function runDeployWorkflow(
 
     await step.do("configure adapters and finish", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
-        const result = await configureAdaptersAndFinish(accessToken, writer.job.options, plan, preflight, logger);
+        const result = await configureAdaptersAndFinish(accessToken, writer.job.options, deploymentPlan, preflight, logger);
         await recordDeploymentSuccess(env, writer, result);
         return result;
       }),
@@ -376,6 +385,7 @@ export async function runDeployWorkflow(
   } finally {
     try {
       await step.do("cleanup deployment credentials", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
+        if (plan) await cleanupDeploymentArtifacts(env, plan, SILENT_LOGGER);
         await deleteDeployToken(env, jobId);
         return { ok: true };
       });
@@ -415,6 +425,7 @@ async function loadDeploymentPhase(env: AppEnv["Bindings"], jobId: string): Prom
 
 async function prepareDeploymentPlan(
   env: AppEnv["Bindings"],
+  jobId: string,
   options: DeployOptions,
   logger: DeployLogger,
 ): Promise<DeploymentPlan> {
@@ -430,13 +441,18 @@ async function prepareDeploymentPlan(
   await logger.info(`Preparing ${components.join(", ")} from ${version}.`);
 
   await logger.step("prepare", "running", `Downloading and verifying ${formatCount(components.length, "component")}.`);
-  await prepareBundles(repoOwner, repoName, version, components, instance, logger);
+  const artifactCachePrefix = deploymentArtifactCachePrefix(jobId);
+  await prepareBundles(env, repoOwner, repoName, version, components, instance, logger, {
+    kind: "release",
+    snapshotPrefix: artifactCachePrefix,
+  });
   await logger.step("prepare", "complete", "GSV components are verified and ready.");
 
-  return { repoOwner, repoName, version, instance, components };
+  return { repoOwner, repoName, version, instance, components, artifactCachePrefix };
 }
 
 async function inspectDeploymentTarget(
+  env: AppEnv["Bindings"],
   accessToken: string,
   accountId: string,
   plan: DeploymentPlan,
@@ -457,7 +473,7 @@ async function inspectDeploymentTarget(
   }
 
   await logger.step("storage", "running", "Checking Cloudflare storage resources.");
-  const prepared = await prepareBundlesForPhase(plan, logger, "Loading verified bundles for storage checks.");
+  const prepared = await prepareBundlesForPhase(env, plan, logger, "Loading verified bundles for storage checks.");
   await ensureStorageResources(accessToken, accountId, prepared, logger);
   await logger.step("storage", "complete", "Storage resources are ready.");
 
@@ -466,13 +482,14 @@ async function inspectDeploymentTarget(
 }
 
 async function deployWorkerScripts(
+  env: AppEnv["Bindings"],
   accessToken: string,
   accountId: string,
   plan: DeploymentPlan,
   preflight: DeploymentPreflight,
   logger: DeployLogger,
 ): Promise<DeploymentWorkersState> {
-  const prepared = await prepareBundlesForPhase(plan, logger, "Loading verified bundles for Worker upload.");
+  const prepared = await prepareBundlesForPhase(env, plan, logger, "Loading verified bundles for Worker upload.");
   const selectedComponents = new Set(plan.components);
   const currentScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
   const existingScriptsWithMigrations = new Map([
@@ -511,6 +528,7 @@ async function deployWorkerScripts(
 }
 
 async function finalizeWorkerBindings(
+  env: AppEnv["Bindings"],
   accessToken: string,
   accountId: string,
   plan: DeploymentPlan,
@@ -518,7 +536,7 @@ async function finalizeWorkerBindings(
   workers: DeploymentWorkersState,
   logger: DeployLogger,
 ): Promise<void> {
-  const prepared = await prepareBundlesForPhase(plan, logger, "Loading verified bundles for binding finalization.");
+  const prepared = await prepareBundlesForPhase(env, plan, logger, "Loading verified bundles for binding finalization.");
   const selectedComponents = new Set(plan.components);
   const availableScripts = new Set(workers.availableScripts);
   const accountSubdomain = preflight.accountSubdomain;
@@ -617,12 +635,16 @@ async function configureAdaptersAndFinish(
 }
 
 async function prepareBundlesForPhase(
+  env: AppEnv["Bindings"],
   plan: DeploymentPlan,
   logger: DeployLogger,
   message: string,
 ): Promise<PreparedBundle[]> {
   await logger.info(message);
-  return prepareBundles(plan.repoOwner, plan.repoName, plan.version, plan.components, plan.instance, SILENT_LOGGER);
+  return prepareBundles(env, plan.repoOwner, plan.repoName, plan.version, plan.components, plan.instance, SILENT_LOGGER, {
+    kind: "snapshot",
+    snapshotPrefix: plan.artifactCachePrefix,
+  });
 }
 
 async function recordDeploymentSuccess(
@@ -956,16 +978,18 @@ function githubApiHeaders(env: AppEnv["Bindings"]): HeadersInit {
 }
 
 async function prepareBundles(
+  env: AppEnv["Bindings"],
   repoOwner: string,
   repoName: string,
   version: string,
   components: string[],
   instance: DeployInstance,
   logger: InfoLogger,
+  source: ReleaseArtifactSource,
 ): Promise<PreparedBundle[]> {
   const checksumsUrl = releaseDownloadUrl(repoOwner, repoName, version, BUNDLE_CHECKSUMS);
   await logger.info(`Fetching checksums from ${checksumsUrl}.`);
-  const checksumsText = await fetchText(checksumsUrl, "Fetch bundle checksums");
+  const checksumsText = await fetchReleaseAssetText(env, repoOwner, repoName, version, BUNDLE_CHECKSUMS, "Fetch bundle checksums", logger, source);
   const checksums = parseChecksums(checksumsText);
   const bundles: PreparedBundle[] = [];
 
@@ -974,9 +998,8 @@ async function prepareBundles(
     const expected = checksums.get(bundleFile);
     if (!expected) throw new Error(`Missing checksum entry for ${bundleFile}.`);
 
-    const url = releaseDownloadUrl(repoOwner, repoName, version, bundleFile);
     await logger.info(`Downloading ${component} bundle.`);
-    const bytes = await fetchBytes(url, `Download ${component} bundle`);
+    const bytes = await fetchReleaseAssetBytes(env, repoOwner, repoName, version, bundleFile, `Download ${component} bundle`, logger, source);
     const actual = await sha256Hex(bytes);
     if (actual !== expected) {
       throw new Error(`Checksum mismatch for ${bundleFile}: expected ${expected}, got ${actual}.`);
@@ -991,6 +1014,187 @@ async function prepareBundles(
 function releaseDownloadUrl(repoOwner: string, repoName: string, tag: string, fileName: string): string {
   const base = `https://github.com/${repoOwner}/${repoName}/releases/download/${tag}/${fileName}`;
   return tag.toLowerCase() === "dev" ? `${base}?ts=${Date.now()}` : base;
+}
+
+async function fetchReleaseAssetText(
+  env: AppEnv["Bindings"],
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  fileName: string,
+  context: string,
+  logger: InfoLogger,
+  source: ReleaseArtifactSource,
+): Promise<string> {
+  return decodeText(await fetchReleaseAssetBytes(env, repoOwner, repoName, version, fileName, context, logger, source));
+}
+
+async function fetchReleaseAssetBytes(
+  env: AppEnv["Bindings"],
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  fileName: string,
+  context: string,
+  logger: InfoLogger,
+  source: ReleaseArtifactSource,
+): Promise<Uint8Array> {
+  if (source.kind === "snapshot") {
+    return readRequiredReleaseAssetCache(
+      env.RELEASE_CACHE,
+      deploymentArtifactCacheKey(source.snapshotPrefix, fileName),
+      fileName,
+    );
+  }
+
+  const url = releaseDownloadUrl(repoOwner, repoName, version, fileName);
+  let bytes: Uint8Array | null = null;
+
+  if (shouldCacheReleaseAsset(version)) {
+    const key = releaseCacheKey(repoOwner, repoName, version, fileName);
+    bytes = await readReleaseAssetCache(env.RELEASE_CACHE, key, fileName, logger);
+    if (!bytes) {
+      bytes = await fetchBytes(url, context);
+      await writeReleaseAssetCache(env.RELEASE_CACHE, key, fileName, repoOwner, repoName, version, bytes, logger);
+    }
+  } else {
+    bytes = await fetchBytes(url, context);
+  }
+
+  await writeDeploymentArtifactCache(env.RELEASE_CACHE, source.snapshotPrefix, fileName, repoOwner, repoName, version, bytes);
+  return bytes;
+}
+
+function shouldCacheReleaseAsset(version: string): boolean {
+  // The dev channel is mutable and intentionally cache-busted at the GitHub URL level.
+  return version.trim().toLowerCase() !== "dev";
+}
+
+function releaseCacheKey(repoOwner: string, repoName: string, version: string, fileName: string): string {
+  return [
+    "github",
+    encodeURIComponent(repoOwner),
+    encodeURIComponent(repoName),
+    "releases",
+    encodeURIComponent(version),
+    encodeURIComponent(fileName),
+  ].join("/");
+}
+
+function deploymentArtifactCachePrefix(jobId: string): string {
+  return ["deployments", encodeURIComponent(jobId), "release-artifacts"].join("/");
+}
+
+function deploymentArtifactCacheKey(prefix: string, fileName: string): string {
+  return `${prefix}/${encodeURIComponent(fileName)}`;
+}
+
+async function readRequiredReleaseAssetCache(
+  cache: R2Bucket,
+  key: string,
+  fileName: string,
+): Promise<Uint8Array> {
+  try {
+    const object = await cache.get(key);
+    if (!object) throw new Error("object not found");
+    return new Uint8Array(await object.arrayBuffer());
+  } catch (error) {
+    throw new Error(`Verified deployment artifact ${fileName} is unavailable in R2: ${errorMessage(error)}`);
+  }
+}
+
+async function readReleaseAssetCache(
+  cache: R2Bucket,
+  key: string,
+  fileName: string,
+  logger: InfoLogger,
+): Promise<Uint8Array | null> {
+  try {
+    const object = await cache.get(key);
+    if (!object) return null;
+    await logger.info(`Release cache hit for ${fileName}.`);
+    return new Uint8Array(await object.arrayBuffer());
+  } catch (error) {
+    await logger.info(`Release cache read failed for ${fileName}: ${errorMessage(error)}. Falling back to GitHub.`);
+    return null;
+  }
+}
+
+async function writeDeploymentArtifactCache(
+  cache: R2Bucket,
+  prefix: string,
+  fileName: string,
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  await cache.put(deploymentArtifactCacheKey(prefix, fileName), bytes, {
+    httpMetadata: { contentType: releaseAssetContentType(fileName) },
+    customMetadata: {
+      source: "deployment-release-artifact",
+      repo: `${repoOwner}/${repoName}`,
+      version,
+      file: fileName,
+      cached_at: new Date().toISOString(),
+    },
+  });
+}
+
+async function writeReleaseAssetCache(
+  cache: R2Bucket,
+  key: string,
+  fileName: string,
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  bytes: Uint8Array,
+  logger: InfoLogger,
+): Promise<void> {
+  try {
+    await cache.put(key, bytes, {
+      httpMetadata: { contentType: releaseAssetContentType(fileName) },
+      customMetadata: {
+        source: "github-release",
+        repo: `${repoOwner}/${repoName}`,
+        version,
+        file: fileName,
+        cached_at: new Date().toISOString(),
+      },
+    });
+    await logger.info(`Cached ${fileName} in release cache.`);
+  } catch (error) {
+    await logger.info(`Release cache write failed for ${fileName}: ${errorMessage(error)}. Continuing with GitHub bytes.`);
+  }
+}
+
+function releaseAssetContentType(fileName: string): string {
+  if (fileName.endsWith(".tar.gz")) return "application/gzip";
+  if (fileName.endsWith(".txt")) return "text/plain; charset=utf-8";
+  return "application/octet-stream";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function cleanupDeploymentArtifacts(
+  env: AppEnv["Bindings"],
+  plan: DeploymentPlan,
+  logger: InfoLogger,
+): Promise<void> {
+  try {
+    await env.RELEASE_CACHE.delete(deploymentArtifactCacheKeys(plan));
+  } catch (error) {
+    await logger.info(`Failed to clean up deployment release artifacts: ${errorMessage(error)}.`);
+  }
+}
+
+function deploymentArtifactCacheKeys(plan: DeploymentPlan): string[] {
+  return [
+    BUNDLE_CHECKSUMS,
+    ...plan.components.map((component) => COMPONENT_TO_BUNDLE[component]).filter(Boolean),
+  ].map((fileName) => deploymentArtifactCacheKey(plan.artifactCachePrefix, fileName));
 }
 
 function parseChecksums(content: string): Map<string, string> {
@@ -1648,12 +1852,6 @@ function readFile(files: Map<string, Uint8Array>, path: string): Uint8Array {
   const file = files.get(normalizePath(path));
   if (!file) throw new Error(`Bundle file missing: ${path}`);
   return file;
-}
-
-async function fetchText(url: string, context: string): Promise<string> {
-  const response = await fetch(url, { headers: { "User-Agent": "gsv-deployment" } });
-  if (!response.ok) throw new Error(`${context} failed (${response.status}).`);
-  return response.text();
 }
 
 async function fetchBytes(url: string, context: string): Promise<Uint8Array> {

@@ -20,6 +20,12 @@
 			"id": "57f022cab6284099838e49a125d7d0ab"
 		}
 	],
+	"r2_buckets": [
+		{
+			"binding": "RELEASE_CACHE",
+			"bucket_name": "gsv-deployment-release-cache"
+		}
+	],
 	"analytics_engine_datasets": [
 		{
 			"binding": "METRICS",
