@@ -85,9 +85,10 @@ npm run dev
 
 ## Notes
 
-The installer keeps Cloudflare OAuth tokens server-side in KV for short-lived
-sessions. It does not persist refresh tokens for long-term account management.
-Future upgrades or teardown should ask the user to authorize again.
+The installer keeps Cloudflare OAuth tokens server-side in KV only long enough
+to finish the submitted deployment. It may persist and use a refresh token for
+that active Workflow, but it does not keep refresh tokens for long-term account
+management. Future upgrades or teardown should ask the user to authorize again.
 
 Deployments run in a Cloudflare Workflow. The browser creates a deploy job,
 starts a Workflow instance, and then polls the job page while the Worker-side

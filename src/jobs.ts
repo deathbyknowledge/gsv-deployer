@@ -1,14 +1,25 @@
-import type { AppEnv, DeployJob, DeployOptions, DeployStep, DeployStepId, DeployStepStatus } from "./types";
-import { randomToken } from "./oauth";
+import type { AppEnv, DeployJob, DeployOptions, DeployStep, DeployStepId, DeployStepStatus, TokenResponse } from "./types";
+import { randomToken, refreshAccessToken, timingSafeEqual } from "./oauth";
 
-const JOB_TTL_SECONDS = 24 * 60 * 60;
-// Covers the split Workflow retry envelope; the browser session can expire while deployment continues.
+export const JOB_TTL_SECONDS = 24 * 60 * 60;
+// Covers the split Workflow retry envelope while refreshable deployment credentials remain available.
 const DEPLOY_TOKEN_TTL_SECONDS = 10 * 60 * 60;
+const DEPLOY_TOKEN_REFRESH_LEEWAY_MS = 2 * 60 * 1000;
 const JOB_FLUSH_INTERVAL_MS = 1_100;
 const JOB_SAVE_RETRY_DELAYS_MS = [1_100, 1_500, 2_500, 4_000];
 
 type FlushOptions = {
   flush?: boolean;
+};
+
+export type CreatedDeployJob = {
+  job: DeployJob;
+  viewToken: string;
+};
+
+type DeployTokenRecord = {
+  token: TokenResponse;
+  expiresAt?: number;
 };
 
 export class DeployJobWriter {
@@ -77,11 +88,14 @@ export async function createJob(
   env: AppEnv["Bindings"],
   sessionId: string,
   options: DeployOptions,
-): Promise<DeployJob> {
+): Promise<CreatedDeployJob> {
   const now = Date.now();
+  const id = randomToken();
+  const viewToken = randomToken();
   const job: DeployJob = {
-    id: randomToken(),
+    id,
     sessionId,
+    viewTokenHash: await hashJobViewToken(id, viewToken),
     status: "queued",
     createdAt: now,
     updatedAt: now,
@@ -90,7 +104,7 @@ export async function createJob(
     logs: [{ at: now, level: "info", message: "Queued deployment." }],
   };
   await saveJob(env, job);
-  return job;
+  return { job, viewToken };
 }
 
 export async function getJob(
@@ -262,18 +276,28 @@ function sleep(ms: number): Promise<void> {
 export async function storeDeployToken(
   env: AppEnv["Bindings"],
   jobId: string,
-  accessToken: string,
+  token: TokenResponse,
+  issuedAt = Date.now(),
 ): Promise<void> {
-  await env.SESSIONS.put(deployTokenKey(jobId), accessToken, {
-    expirationTtl: DEPLOY_TOKEN_TTL_SECONDS,
-  });
+  await saveDeployTokenRecord(env, jobId, createDeployTokenRecord(token, issuedAt));
 }
 
 export async function getDeployToken(
   env: AppEnv["Bindings"],
   jobId: string,
 ): Promise<string | null> {
-  return env.SESSIONS.get(deployTokenKey(jobId));
+  const record = await getDeployTokenRecord(env, jobId);
+  if (!record) return null;
+  if (!shouldRefreshDeployToken(record)) return record.token.access_token;
+
+  if (!record.token.refresh_token) return null;
+  const refreshed = await refreshAccessToken(env, record.token.refresh_token);
+  const updated = createDeployTokenRecord({
+    ...refreshed,
+    refresh_token: refreshed.refresh_token ?? record.token.refresh_token,
+  });
+  await saveDeployTokenRecord(env, jobId, updated);
+  return updated.token.access_token;
 }
 
 export async function deleteDeployToken(
@@ -283,12 +307,75 @@ export async function deleteDeployToken(
   await env.SESSIONS.delete(deployTokenKey(jobId));
 }
 
+export async function verifyJobViewToken(job: DeployJob, token: string | null): Promise<boolean> {
+  if (!token || !job.viewTokenHash) return false;
+  const hash = await hashJobViewToken(job.id, token);
+  return timingSafeEqual(hash, job.viewTokenHash);
+}
+
 function jobKey(jobId: string): string {
   return `deploy-job:${jobId}`;
 }
 
 function deployTokenKey(jobId: string): string {
   return `deploy-token:${jobId}`;
+}
+
+function createDeployTokenRecord(token: TokenResponse, issuedAt = Date.now()): DeployTokenRecord {
+  const expiresAt =
+    typeof token.expires_in === "number" && token.expires_in > 0
+      ? issuedAt + token.expires_in * 1000
+      : undefined;
+  return { token, expiresAt };
+}
+
+async function saveDeployTokenRecord(
+  env: AppEnv["Bindings"],
+  jobId: string,
+  record: DeployTokenRecord,
+): Promise<void> {
+  await env.SESSIONS.put(deployTokenKey(jobId), JSON.stringify(record), {
+    expirationTtl: DEPLOY_TOKEN_TTL_SECONDS,
+  });
+}
+
+async function getDeployTokenRecord(env: AppEnv["Bindings"], jobId: string): Promise<DeployTokenRecord | null> {
+  const raw = await env.SESSIONS.get(deployTokenKey(jobId));
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (isRecord(parsed) && isRecord(parsed.token) && typeof parsed.token.access_token === "string") {
+      return {
+        token: parsed.token as TokenResponse,
+        expiresAt: typeof parsed.expiresAt === "number" ? parsed.expiresAt : undefined,
+      };
+    }
+    if (isRecord(parsed) && typeof parsed.access_token === "string") {
+      return createDeployTokenRecord(parsed as TokenResponse);
+    }
+  } catch {
+    // Backward compatibility for in-flight jobs created before token records were JSON.
+  }
+
+  return { token: { access_token: raw, token_type: "Bearer" } };
+}
+
+function shouldRefreshDeployToken(record: DeployTokenRecord): boolean {
+  return typeof record.expiresAt === "number" && Date.now() + DEPLOY_TOKEN_REFRESH_LEEWAY_MS >= record.expiresAt;
+}
+
+async function hashJobViewToken(jobId: string, token: string): Promise<string> {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${jobId}:${token}`));
+  return hex(bytes);
+}
+
+function hex(buffer: ArrayBuffer): string {
+  return [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function normalizeJob(job: DeployJob): DeployJob {

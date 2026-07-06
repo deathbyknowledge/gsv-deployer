@@ -119,6 +119,28 @@ export async function fetchAccounts(accessToken: string): Promise<Account[]> {
   return body.success && Array.isArray(body.result) ? body.result : [];
 }
 
+export async function refreshAccessToken(env: AppEnv["Bindings"], refreshToken: string): Promise<TokenResponse> {
+  const request = buildRefreshTokenRequest({
+    clientId: env.CF_OAUTH_CLIENT_ID,
+    clientSecret: env.CF_OAUTH_CLIENT_SECRET,
+    method: resolveTokenAuthMethod(env.OAUTH_TOKEN_AUTH_METHOD),
+    refreshToken,
+  });
+
+  const response = await fetch("https://dash.cloudflare.com/oauth2/token", {
+    method: "POST",
+    headers: request.headers,
+    body: request.body,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`OAuth token refresh failed with ${response.status}: ${errorBody.slice(0, 500)}`);
+  }
+
+  return response.json<TokenResponse>();
+}
+
 function callbackUrl(c: Context<AppEnv>): string {
   return `${c.env.APP_ORIGIN.replace(/\/$/, "")}/oauth/callback`;
 }
@@ -173,6 +195,30 @@ export function buildTokenRequest(params: {
     code: params.code,
     grant_type: "authorization_code",
     redirect_uri: params.redirectUri,
+  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+
+  if (params.method === "client_secret_basic") {
+    headers.Authorization = basicAuthHeader(params.clientId, params.clientSecret);
+  } else {
+    body.set("client_id", params.clientId);
+    body.set("client_secret", params.clientSecret);
+  }
+
+  return { body, headers };
+}
+
+function buildRefreshTokenRequest(params: {
+  clientId: string;
+  clientSecret: string;
+  method: TokenAuthMethod;
+  refreshToken: string;
+}): { body: URLSearchParams; headers: Record<string, string> } {
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: params.refreshToken,
   });
   const headers: Record<string, string> = {
     "Content-Type": "application/x-www-form-urlencoded",
