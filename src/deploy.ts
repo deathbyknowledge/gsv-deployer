@@ -465,18 +465,13 @@ async function inspectDeploymentTarget(
   logger: DeployLogger,
 ): Promise<DeploymentPreflight> {
   const selectedComponents = new Set(plan.components);
-  const ripgitScriptName = scriptNameForComponent(plan.instance, COMPONENT_RIPGIT);
-  const assemblerScriptName = scriptNameForComponent(plan.instance, COMPONENT_ASSEMBLER);
-
   const existingScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
   const existingScripts = new Set([...existingScriptsWithMigrations.keys()]);
-
-  if (selectedComponents.has(COMPONENT_GATEWAY) && !selectedComponents.has(COMPONENT_RIPGIT) && !existingScripts.has(ripgitScriptName)) {
-    throw new Error("Deploying gateway requires ripgit. Select ripgit or deploy it first.");
-  }
-  if (selectedComponents.has(COMPONENT_GATEWAY) && !selectedComponents.has(COMPONENT_ASSEMBLER) && !existingScripts.has(assemblerScriptName)) {
-    throw new Error("Deploying gateway requires assembler. Select assembler or deploy it first.");
-  }
+  assertGatewayDependenciesAvailable(
+    selectedComponents,
+    selectedOrExistingScripts(selectedComponents, existingScripts, plan.instance),
+    plan.instance,
+  );
 
   await logger.step("storage", "running", "Checking Cloudflare storage resources.");
   const prepared = await prepareBundlesForPhase(env, plan, logger, "Loading verified bundles for storage checks.");
@@ -499,6 +494,11 @@ async function deployWorkerScripts(
   const selectedComponents = new Set(plan.components);
   const existingScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
   const accountSubdomain = preflight.accountSubdomain;
+  assertGatewayDependenciesAvailable(
+    selectedComponents,
+    selectedOrExistingScripts(selectedComponents, new Set(existingScriptsWithMigrations.keys()), plan.instance),
+    plan.instance,
+  );
   const availableScripts = new Set(existingScriptsWithMigrations.keys());
 
   await logger.step("workers", "running", `Uploading ${formatCount(prepared.length, "Worker")}.`);
@@ -542,6 +542,7 @@ async function finalizeWorkerBindings(
   for (const component of selectedComponents) {
     availableScripts.add(scriptNameForComponent(plan.instance, component));
   }
+  assertGatewayDependenciesAvailable(selectedComponents, availableScripts, plan.instance);
   const accountSubdomain = preflight.accountSubdomain;
 
   await logger.step("bindings", "running", "Connecting GSV services.");
@@ -878,6 +879,32 @@ function scriptNameForComponent(instance: DeployInstance, component: string): st
       return `${instance.name}-channel-telegram`;
     default:
       throw new Error(`Unsupported component: ${component}`);
+  }
+}
+
+function selectedOrExistingScripts(
+  selectedComponents: Set<string>,
+  existingScripts: Set<string>,
+  instance: DeployInstance,
+): Set<string> {
+  const scripts = new Set(existingScripts);
+  for (const component of selectedComponents) {
+    scripts.add(scriptNameForComponent(instance, component));
+  }
+  return scripts;
+}
+
+function assertGatewayDependenciesAvailable(
+  selectedComponents: Set<string>,
+  availableScripts: Set<string>,
+  instance: DeployInstance,
+): void {
+  if (!selectedComponents.has(COMPONENT_GATEWAY)) return;
+  if (!availableScripts.has(scriptNameForComponent(instance, COMPONENT_RIPGIT))) {
+    throw new Error("Deploying gateway requires ripgit. Select ripgit or deploy it first.");
+  }
+  if (!availableScripts.has(scriptNameForComponent(instance, COMPONENT_ASSEMBLER))) {
+    throw new Error("Deploying gateway requires assembler. Select assembler or deploy it first.");
   }
 }
 

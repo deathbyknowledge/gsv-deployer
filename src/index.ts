@@ -5,7 +5,18 @@ export { GsvDeployWorkflow } from "./workflow";
 import { ALL_COMPONENTS, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
 import departureMonoWoff2 from "./assets/departure-mono.woff2";
 import { ANALYTICS_SCRIPT } from "./analytics";
-import { appendLog, createJob, deleteDeployToken, failActiveJobStep, getJob, storeDeployToken, updateJob } from "./jobs";
+import {
+  appendLog,
+  createJob,
+  deleteDeployToken,
+  failActiveJobStep,
+  getJob,
+  JOB_TTL_SECONDS,
+  storeDeployToken,
+  updateJob,
+  verifyJobViewToken,
+} from "./jobs";
+import { getCookie, setCookie } from "./cookies";
 import { page } from "./html";
 import { fetchAccounts, getSessionWithId, handleCallback, logout, requireSession, startLogin } from "./oauth";
 import { deployPage, errorPage, homePage, jobPage, metricsPage, noAccountsPage } from "./pages";
@@ -19,7 +30,7 @@ import {
   requireMetricsAuth,
   trackRequestEvent,
 } from "./metrics";
-import type { AppEnv, DeployOptions } from "./types";
+import type { AppEnv, DeployJob, DeployOptions } from "./types";
 
 const app = new Hono<AppEnv>();
 
@@ -125,7 +136,7 @@ app.post("/deploy", async (c) => {
     telegramBotToken: optionalStringField(form, "telegramBotToken"),
   };
 
-  const job = await createJob(c.env, current.sessionId, options);
+  const { job, viewToken } = await createJob(c.env, current.sessionId, options);
   trackRequestEvent(
     c.env,
     c.req.raw,
@@ -136,7 +147,7 @@ app.post("/deploy", async (c) => {
     options.instance,
     options.accountName || options.accountId,
   );
-  await storeDeployToken(c.env, job.id, current.session.token.access_token);
+  await storeDeployToken(c.env, job.id, current.session.token, sessionCreatedAtMs(current.session.createdAt));
   try {
     const instance = await c.env.DEPLOY_WORKFLOW.create({
       id: job.id,
@@ -155,19 +166,25 @@ app.post("/deploy", async (c) => {
     await updateJob(c.env, job.id, { status: "failed", error: message });
   }
   // `?submitted=1` signals the job page to fire the one-time deploy_submit event.
-  return c.redirect(`/jobs/${job.id}?submitted=1`);
+  return redirectWithCookies(`/jobs/${job.id}?submitted=1`, [
+    setCookie(jobViewCookieName(job.id), viewToken, JOB_TTL_SECONDS),
+  ]);
 });
 
 app.get("/jobs/:id", async (c) => {
-  let current;
-  try {
-    current = await requireSession(c);
-  } catch {
-    return c.redirect("/login");
+  const job = await getJob(c.env, c.req.param("id"));
+  if (!job) {
+    return page(c, {
+      title: "Not Found",
+      body: errorPage("Not Found", "Deployment job was not found."),
+      status: 404,
+    });
   }
 
-  const job = await getJob(c.env, c.req.param("id"));
-  if (!job || job.sessionId !== current.sessionId) {
+  const current = await getSessionWithId(c);
+  const canView = await canViewJob(c.req.raw, job, current?.sessionId);
+  if (!canView) {
+    if (!current) return c.redirect("/login");
     return page(c, {
       title: "Not Found",
       body: errorPage("Not Found", "Deployment job was not found."),
@@ -185,10 +202,11 @@ app.get("/jobs/:id", async (c) => {
 
 app.get("/api/jobs/:id", async (c) => {
   const current = await getSessionWithId(c);
-  if (!current) return c.json({ error: "Authentication required" }, 401);
-
   const job = await getJob(c.env, c.req.param("id"));
-  if (!job || job.sessionId !== current.sessionId) return c.json({ error: "Not found" }, 404);
+  if (!job) return c.json({ error: "Not found" }, 404);
+
+  const canView = await canViewJob(c.req.raw, job, current?.sessionId);
+  if (!canView) return c.json({ error: current ? "Not found" : "Authentication required" }, current ? 404 : 401);
   return c.json(job);
 });
 
@@ -259,6 +277,26 @@ function parseExistingTarget(value: string): { accountId: string; instance: stri
   const accountId = parts[1]?.trim();
   const instance = parts[2]?.trim();
   return accountId && instance ? { accountId, instance } : null;
+}
+
+async function canViewJob(request: Request, job: DeployJob, sessionId?: string): Promise<boolean> {
+  if (sessionId && job.sessionId === sessionId) return true;
+  return verifyJobViewToken(job, getCookie(request, jobViewCookieName(job.id)));
+}
+
+function jobViewCookieName(jobId: string): string {
+  return `gsv_deploy_job_${jobId}`;
+}
+
+function sessionCreatedAtMs(createdAt: string): number | undefined {
+  const value = Date.parse(createdAt);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function redirectWithCookies(location: string, cookies: string[]): Response {
+  const headers = new Headers({ Location: location });
+  for (const cookie of cookies) headers.append("Set-Cookie", cookie);
+  return new Response(null, { status: 302, headers });
 }
 
 export default app;

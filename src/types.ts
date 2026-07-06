@@ -73,6 +73,7 @@ export type DeployStep = {
 export type DeployJob = {
   id: string;
   sessionId: string;
+  viewTokenHash?: string;
   status: DeployStatus;
   createdAt: number;
   updatedAt: number;
