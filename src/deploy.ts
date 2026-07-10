@@ -391,7 +391,7 @@ export async function runDeployWorkflow(
   } finally {
     try {
       await step.do("cleanup deployment credentials", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
-        await cleanupDeploymentArtifactPrefix(env, deploymentArtifactCachePrefix(jobId), SILENT_LOGGER);
+        await cleanupDeploymentArtifactPrefix(env, deploymentArtifactCachePrefix(jobId), SILENT_LOGGER, true);
         await deleteDeployToken(env, jobId);
         return { ok: true };
       });
@@ -1237,6 +1237,7 @@ async function cleanupDeploymentArtifactPrefix(
   env: AppEnv["Bindings"],
   artifactCachePrefix: string,
   logger: InfoLogger,
+  throwOnError = false,
 ): Promise<void> {
   try {
     let cursor: string | undefined;
@@ -1254,6 +1255,7 @@ async function cleanupDeploymentArtifactPrefix(
     } while (cursor);
   } catch (error) {
     await logger.info(`Failed to clean up deployment release artifacts: ${errorMessage(error)}.`);
+    if (throwOnError) throw error;
   }
 }
 

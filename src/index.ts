@@ -202,11 +202,10 @@ app.get("/jobs/:id", async (c) => {
 
 app.get("/api/jobs/:id", async (c) => {
   const current = await getSessionWithId(c);
-  const job = await getJob(c.env, c.req.param("id"));
-  if (!job) return c.json({ error: "Not found" }, 404);
+  if (!current) return c.json({ error: "Authentication required" }, 401);
 
-  const canView = await canViewJob(c.req.raw, job, current?.sessionId);
-  if (!canView) return c.json({ error: current ? "Not found" : "Authentication required" }, current ? 404 : 401);
+  const job = await getJob(c.env, c.req.param("id"));
+  if (!job || job.sessionId !== current.sessionId) return c.json({ error: "Not found" }, 404);
   return c.json(job);
 });
 
