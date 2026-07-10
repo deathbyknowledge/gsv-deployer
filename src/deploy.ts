@@ -4,9 +4,16 @@ import { parse as parseJsonc } from "jsonc-parser";
 import { ungzip } from "pako";
 import { parse as parseToml } from "smol-toml";
 
-import { deleteDeployToken, DeployJobWriter, getDeployToken } from "./jobs";
+import { deleteDeployCredentials, DeployJobWriter, getDeployCredentials } from "./jobs";
 import { trackEvent } from "./metrics";
-import type { Account, AppEnv, DeployOptions, DeployStepId, DeployStepStatus } from "./types";
+import type {
+  Account,
+  AppEnv,
+  DeployAdapterSecrets,
+  DeployOptions,
+  DeployStepId,
+  DeployStepStatus,
+} from "./types";
 
 const COMPONENT_GATEWAY = "gateway";
 const COMPONENT_RIPGIT = "ripgit";
@@ -211,6 +218,7 @@ type DeploymentResult = {
 
 type DeploymentPhase = {
   accessToken: string;
+  adapterSecrets: DeployAdapterSecrets;
   writer: DeployJobWriter;
   logger: DeployLogger;
 };
@@ -307,96 +315,81 @@ export async function findExistingGsvInstallations(
   });
 }
 
-export async function runDeployJob(
-  env: AppEnv["Bindings"],
-  jobId: string,
-  accessToken: string,
-): Promise<void> {
-  const writer = await DeployJobWriter.load(env, jobId);
-  if (!writer) return;
-  let plan: DeploymentPlan | null = null;
-
-  try {
-    const logger = new DeployLogger(writer);
-    await writer.update({ status: "running" }, { flush: false });
-    plan = await prepareDeploymentPlan(env, jobId, writer.job.options, logger);
-    const preflight = await inspectDeploymentTarget(env, accessToken, writer.job.options.accountId, plan, logger);
-    await deployWorkerScripts(env, accessToken, writer.job.options.accountId, plan, preflight, logger);
-    await finalizeWorkerBindings(env, accessToken, writer.job.options.accountId, plan, preflight, logger);
-    const result = await configureAdaptersAndFinish(accessToken, writer.job.options, plan, preflight, logger);
-    await recordDeploymentSuccess(env, writer, result);
-  } catch (error) {
-    await recordDeploymentFailureWithWriter(env, writer, error);
-    if (error instanceof Error) throw error;
-    throw new Error(String(error));
-  } finally {
-    await writer.flush();
-    await cleanupDeploymentArtifactPrefix(env, deploymentArtifactCachePrefix(jobId), SILENT_LOGGER);
-  }
-}
-
 export async function runDeployWorkflow(
   env: AppEnv["Bindings"],
   jobId: string,
   step: WorkflowStep,
 ): Promise<void> {
-  let plan: DeploymentPlan | null = null;
   try {
-    plan = await step.do("prepare deployment", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+    const deploymentPlan = await step.do("prepare deployment", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, async ({ writer, logger }) => {
         await writer.update({ status: "running" }, { flush: false });
         return prepareDeploymentPlan(env, jobId, writer.job.options, logger);
       }),
     );
-    if (!plan) return;
-    const deploymentPlan = plan;
 
     const preflight = await step.do("inspect target and ensure storage", SENSITIVE_DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, ({ accessToken, writer, logger }) =>
         inspectDeploymentTarget(env, accessToken, writer.job.options.accountId, deploymentPlan, logger),
       ),
     );
-    if (!preflight) return;
 
-    const workersDeployed = await step.do("deploy worker scripts", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+    await step.do("deploy worker scripts", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
         await deployWorkerScripts(env, accessToken, writer.job.options.accountId, deploymentPlan, preflight, logger);
         return { ok: true };
       }),
     );
-    if (!workersDeployed) return;
 
-    const bindingsFinalized = await step.do("finalize worker bindings", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+    await step.do("finalize worker bindings", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
       withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
         await finalizeWorkerBindings(env, accessToken, writer.job.options.accountId, deploymentPlan, preflight, logger);
         return { ok: true };
       }),
     );
-    if (!bindingsFinalized) return;
 
     await step.do("configure adapters and finish", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
-      withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
-        const result = await configureAdaptersAndFinish(accessToken, writer.job.options, deploymentPlan, preflight, logger);
+      withDeploymentPhase(env, jobId, async ({ accessToken, adapterSecrets, writer, logger }) => {
+        const result = await configureAdaptersAndFinish(
+          accessToken,
+          writer.job.options,
+          adapterSecrets,
+          deploymentPlan,
+          preflight,
+          logger,
+        );
         await recordDeploymentSuccess(env, writer, result);
         return result;
       }),
     );
   } catch (error) {
-    await step.do("record deployment failure", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
-      await recordDeploymentFailure(env, jobId, error);
-      return { ok: true };
-    });
+    try {
+      await step.do("record deployment failure", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
+        await recordDeploymentFailure(env, jobId, error);
+        return { ok: true };
+      });
+    } catch (recordError) {
+      logWorkflowMaintenanceError(jobId, "record deployment failure", recordError);
+    }
     if (error instanceof Error) throw error;
     throw new Error(String(error));
   } finally {
     try {
       await step.do("cleanup deployment credentials", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
-        await cleanupDeploymentArtifactPrefix(env, deploymentArtifactCachePrefix(jobId), SILENT_LOGGER, true);
-        await deleteDeployToken(env, jobId);
+        await deleteDeployCredentials(env, jobId);
         return { ok: true };
       });
-    } catch {
-      // The deploy token also has a short TTL; cleanup should not mask the deployment result.
+    } catch (error) {
+      logWorkflowMaintenanceError(jobId, "cleanup deployment credentials", error);
+    }
+
+    try {
+      await step.do("cleanup deployment artifacts", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
+        await cleanupDeploymentArtifactPrefix(env, deploymentArtifactCachePrefix(jobId), SILENT_LOGGER, true);
+        return { ok: true };
+      });
+    } catch (error) {
+      logWorkflowMaintenanceError(jobId, "cleanup deployment artifacts", error);
     }
   }
 }
@@ -405,9 +398,8 @@ async function withDeploymentPhase<T>(
   env: AppEnv["Bindings"],
   jobId: string,
   callback: (phase: DeploymentPhase) => Promise<T>,
-): Promise<T | null> {
+): Promise<T> {
   const phase = await loadDeploymentPhase(env, jobId);
-  if (!phase) return null;
   try {
     return await callback(phase);
   } finally {
@@ -415,18 +407,30 @@ async function withDeploymentPhase<T>(
   }
 }
 
-async function loadDeploymentPhase(env: AppEnv["Bindings"], jobId: string): Promise<DeploymentPhase | null> {
+async function loadDeploymentPhase(env: AppEnv["Bindings"], jobId: string): Promise<DeploymentPhase> {
   const writer = await DeployJobWriter.load(env, jobId);
-  if (!writer) return null;
+  if (!writer) throw new Error(`Deployment job ${jobId} was not found.`);
 
-  const accessToken = await getDeployToken(env, jobId);
-  if (!accessToken) {
-    const message = "Deployment credentials expired before the workflow started. Please authorize Cloudflare again.";
-    await recordDeploymentFailureWithWriter(env, writer, message);
-    throw new Error(message);
-  }
+  const credentials = await getDeployCredentials(env, jobId);
+  if (!credentials) throw new Error("Deployment credentials expired. Please authorize Cloudflare again.");
 
-  return { accessToken, writer, logger: new DeployLogger(writer) };
+  return {
+    accessToken: credentials.accessToken,
+    adapterSecrets: {
+      discordBotToken: credentials.discordBotToken,
+      telegramBotToken: credentials.telegramBotToken,
+    },
+    writer,
+    logger: new DeployLogger(writer),
+  };
+}
+
+function logWorkflowMaintenanceError(jobId: string, operation: string, error: unknown): void {
+  console.error(JSON.stringify({
+    error: error instanceof Error ? error.message : String(error),
+    jobId,
+    message: `Workflow maintenance step failed: ${operation}`,
+  }));
 }
 
 async function prepareDeploymentPlan(
@@ -570,6 +574,7 @@ async function finalizeWorkerBindings(
 async function configureAdaptersAndFinish(
   accessToken: string,
   options: DeployOptions,
+  adapterSecrets: DeployAdapterSecrets,
   plan: DeploymentPlan,
   preflight: DeploymentPreflight,
   logger: DeployLogger,
@@ -583,26 +588,26 @@ async function configureAdaptersAndFinish(
     await logger.step("adapters", "running", "Applying channel configuration.");
   }
   const adapterNotes: string[] = [];
-  if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD) && options.discordBotToken) {
+  if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD) && adapterSecrets.discordBotToken) {
     await setWorkerSecret(
       accessToken,
       options.accountId,
       scriptNameForComponent(plan.instance, COMPONENT_CHANNEL_DISCORD),
       "DISCORD_BOT_TOKEN",
-      options.discordBotToken,
+      adapterSecrets.discordBotToken,
     );
     await logger.info("Configured DISCORD_BOT_TOKEN.");
   } else if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD)) {
     adapterNotes.push("Discord needs a bot token before it can receive messages.");
   }
 
-  if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && options.telegramBotToken) {
+  if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && adapterSecrets.telegramBotToken) {
     await setWorkerSecret(
       accessToken,
       options.accountId,
       scriptNameForComponent(plan.instance, COMPONENT_CHANNEL_TELEGRAM),
       "TELEGRAM_BOT_TOKEN",
-      options.telegramBotToken,
+      adapterSecrets.telegramBotToken,
     );
     await logger.info("Configured TELEGRAM_BOT_TOKEN.");
   } else if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM)) {

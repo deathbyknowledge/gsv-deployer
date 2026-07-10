@@ -8,7 +8,7 @@ that account without creating an API token or installing the `gsv` CLI first.
 
 ## Setup
 
-Create a KV namespace for installer sessions and jobs:
+Create a KV namespace for OAuth state and browser sessions:
 
 ```bash
 npx wrangler kv namespace create SESSIONS
@@ -25,12 +25,22 @@ npx wrangler r2 bucket create gsv-deployment-release-cache
 
 The bucket is bound as `RELEASE_CACHE` in `wrangler.jsonc`. It is used only by
 the installer Worker to avoid repeatedly downloading immutable release assets
-from GitHub.
+from GitHub. Per-deployment snapshots are deleted by the Workflow after use;
+add a lifecycle rule as a backstop for Workflows that are terminated before
+cleanup runs:
+
+```bash
+npx wrangler r2 bucket lifecycle add gsv-deployment-release-cache \
+  expire-deployment-artifacts deployments/ --expire-days 1
+```
+
+The `github/` prefix contains checksum-verified immutable release assets and is
+not covered by this rule.
 
 Create a Cloudflare OAuth client:
 
 - Response type: `code`
-- Grant type: `authorization_code`
+- Grant types: `authorization_code`, `refresh_token`
 - Token authentication method: `client_secret_post`
 - Client URL: `https://gsv-deployment.the-agents-company.workers.dev`
 - Privacy policy URL: `https://gsv-deployment.the-agents-company.workers.dev/privacy`
@@ -77,17 +87,22 @@ For local development, set equivalent values in `.dev.vars`.
 
 ## Development
 
+Use Node.js 22 or newer.
+
 ```bash
 npm install
 npm run typecheck
+npm test
 npm run dev
 ```
 
 ## Notes
 
-The installer keeps Cloudflare OAuth tokens server-side in KV only long enough
-to finish the submitted deployment. It may persist and use a refresh token for
-that active Workflow, but it does not keep refresh tokens for long-term account
+The installer keeps OAuth state and browser sessions in KV. Each deployment has
+an isolated SQLite-backed Durable Object that atomically stores job progress and
+short-lived deployment credentials. It may refresh the OAuth token while that
+Workflow is active, then deletes deployment credentials during cleanup; expiry
+alarms provide a backstop. It does not keep refresh tokens for long-term account
 management. Future upgrades or teardown should ask the user to authorize again.
 
 Deployments run in a Cloudflare Workflow. The browser creates a deploy job,
