@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 
 export { GsvDeployWorkflow } from "./workflow";
+export { DeployJobState } from "./deploy-job";
 
 import { ALL_COMPONENTS, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
 import departureMonoWoff2 from "./assets/departure-mono.woff2";
@@ -8,12 +9,10 @@ import { ANALYTICS_SCRIPT } from "./analytics";
 import {
   appendLog,
   createJob,
-  deleteDeployToken,
-  failActiveJobStep,
   getJob,
   JOB_TTL_SECONDS,
-  storeDeployToken,
-  updateJob,
+  markJobStartFailure,
+  toPublicDeployJob,
   verifyJobViewToken,
 } from "./jobs";
 import { getCookie, setCookie } from "./cookies";
@@ -30,7 +29,7 @@ import {
   requireMetricsAuth,
   trackRequestEvent,
 } from "./metrics";
-import type { AppEnv, DeployJob, DeployOptions } from "./types";
+import type { AppEnv, DeployAdapterSecrets, DeployJob, DeployOptions } from "./types";
 
 const app = new Hono<AppEnv>();
 
@@ -132,11 +131,19 @@ app.post("/deploy", async (c) => {
     instance: (existingTarget?.instance ?? stringField(form, "instance")) || "gsv",
     version: stringField(form, "version") || "latest",
     components: components.length > 0 ? components : [...ALL_COMPONENTS],
+  };
+  const adapterSecrets: DeployAdapterSecrets = {
     discordBotToken: optionalStringField(form, "discordBotToken"),
     telegramBotToken: optionalStringField(form, "telegramBotToken"),
   };
 
-  const { job, viewToken } = await createJob(c.env, current.sessionId, options);
+  const { job, viewToken } = await createJob(c.env, {
+    sessionId: current.sessionId,
+    options,
+    token: current.session.token,
+    tokenIssuedAt: sessionCreatedAtMs(current.session.createdAt),
+    adapterSecrets,
+  });
   trackRequestEvent(
     c.env,
     c.req.raw,
@@ -147,7 +154,6 @@ app.post("/deploy", async (c) => {
     options.instance,
     options.accountName || options.accountId,
   );
-  await storeDeployToken(c.env, job.id, current.session.token, sessionCreatedAtMs(current.session.createdAt));
   try {
     const instance = await c.env.DEPLOY_WORKFLOW.create({
       id: job.id,
@@ -157,13 +163,23 @@ app.post("/deploy", async (c) => {
         errorRetention: "7 days",
       },
     });
-    await appendLog(c.env, job.id, "info", `Started deployment workflow ${instance.id}.`);
+    try {
+      await appendLog(c.env, job.id, "info", `Started deployment workflow ${instance.id}.`);
+    } catch (error) {
+      console.error(JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+        jobId: job.id,
+        message: "Could not append workflow startup diagnostic",
+      }));
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await deleteDeployToken(c.env, job.id);
-    await failActiveJobStep(c.env, job.id, "The deployment workflow could not start. Retry the deployment in a moment.");
-    await appendLog(c.env, job.id, "error", `Failed to start deployment workflow: ${message}`);
-    await updateJob(c.env, job.id, { status: "failed", error: message });
+    await markJobStartFailure(
+      c.env,
+      job.id,
+      "The deployment workflow could not start. Retry the deployment in a moment.",
+      message,
+    );
   }
   // `?submitted=1` signals the job page to fire the one-time deploy_submit event.
   return redirectWithCookies(`/jobs/${job.id}?submitted=1`, [
@@ -206,7 +222,7 @@ app.get("/api/jobs/:id", async (c) => {
 
   const job = await getJob(c.env, c.req.param("id"));
   if (!job || job.sessionId !== current.sessionId) return c.json({ error: "Not found" }, 404);
-  return c.json(job);
+  return c.json(toPublicDeployJob(job));
 });
 
 app.get("/metrics", async (c) => {
@@ -241,7 +257,7 @@ app.get("/health", (c) => c.json({ ok: true }));
 app.get("/privacy", (c) =>
   page(c, {
     title: "Privacy",
-    body: `<p class="eyebrow">Privacy</p><h1 class="page-title">Privacy</h1><p class="prose">This installer stores Cloudflare OAuth session data server-side only long enough to perform deployment. Session and job data expire automatically from KV.</p>`,
+    body: `<p class="eyebrow">Privacy</p><h1 class="page-title">Privacy</h1><p class="prose">This installer stores Cloudflare OAuth session data server-side only long enough to perform deployment. Sessions expire automatically from KV; deployment state and credentials expire from isolated Durable Object storage.</p>`,
   }),
 );
 
