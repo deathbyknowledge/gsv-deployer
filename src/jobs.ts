@@ -1,143 +1,327 @@
-import type { AppEnv, DeployJob, DeployOptions, DeployStep, DeployStepId, DeployStepStatus } from "./types";
-import { randomToken } from "./oauth";
+import {
+  appendLogToJob,
+  failActiveStepOnJob,
+  JOB_TTL_SECONDS,
+  updateStepOnJob,
+} from "./deploy-job";
+import { randomToken, refreshAccessToken, timingSafeEqual } from "./oauth";
+import type {
+  ActiveDeployCredentials,
+  AppEnv,
+  DeployAdapterSecrets,
+  DeployCredentialRecord,
+  DeployJob,
+  DeployOptions,
+  DeployStep,
+  DeployStepId,
+  DeployStepStatus,
+  PublicDeployJob,
+  TokenResponse,
+} from "./types";
 
-const JOB_TTL_SECONDS = 24 * 60 * 60;
-const DEPLOY_TOKEN_TTL_SECONDS = 2 * 60 * 60;
+export { JOB_TTL_SECONDS } from "./deploy-job";
 
-export async function createJob(
-  env: AppEnv["Bindings"],
-  sessionId: string,
-  options: DeployOptions,
-): Promise<DeployJob> {
-  const now = Date.now();
-  const job: DeployJob = {
-    id: randomToken(),
-    sessionId,
-    status: "queued",
-    createdAt: now,
-    updatedAt: now,
-    options,
-    steps: createDeploySteps(options, now),
-    logs: [{ at: now, level: "info", message: "Queued deployment." }],
-  };
-  await saveJob(env, job);
-  return job;
-}
+const DEPLOY_TOKEN_REFRESH_LEEWAY_MS = 35 * 60 * 1000;
+const JOB_FLUSH_INTERVAL_MS = 1_000;
 
-export async function getJob(
-  env: AppEnv["Bindings"],
-  jobId: string,
-): Promise<DeployJob | null> {
-  const raw = await env.SESSIONS.get(jobKey(jobId));
-  if (!raw) return null;
-  try {
-    return normalizeJob(JSON.parse(raw) as DeployJob);
-  } catch {
-    return null;
+type FlushOptions = {
+  flush?: boolean;
+};
+
+export type CreateDeployJobInput = {
+  sessionId: string;
+  options: DeployOptions;
+  token: TokenResponse;
+  tokenIssuedAt?: number;
+  adapterSecrets?: DeployAdapterSecrets;
+};
+
+export type CreatedDeployJob = {
+  job: DeployJob;
+  viewToken: string;
+};
+
+export class DeployJobWriter {
+  private dirty = false;
+  private lastFlushAt = 0;
+
+  private constructor(
+    private readonly env: AppEnv["Bindings"],
+    readonly job: DeployJob,
+  ) {}
+
+  static async load(env: AppEnv["Bindings"], jobId: string): Promise<DeployJobWriter | null> {
+    const job = await getJobForWriter(env, jobId);
+    return job ? new DeployJobWriter(env, job) : null;
+  }
+
+  async appendLog(level: "info" | "warning" | "error", message: string, options?: FlushOptions): Promise<void> {
+    appendLogToJob(this.job, level, message);
+    await this.markDirty(options);
+  }
+
+  async update(patch: Partial<DeployJob>, options?: FlushOptions): Promise<void> {
+    Object.assign(this.job, patch);
+    await this.markDirty(options);
+  }
+
+  async updateStep(
+    stepId: DeployStepId,
+    status: DeployStepStatus,
+    detail?: string,
+    options?: FlushOptions,
+  ): Promise<void> {
+    updateStepOnJob(this.job, stepId, status, detail);
+    await this.markDirty(options);
+  }
+
+  async failActiveStep(detail: string, options?: FlushOptions): Promise<void> {
+    failActiveStepOnJob(this.job, detail);
+    await this.markDirty(options);
+  }
+
+  async flush(force = false): Promise<void> {
+    if (!this.dirty && !force) return;
+    const merged = await deployJobState(this.env, this.job.id).mergeJob(this.job);
+    Object.assign(this.job, merged);
+    this.dirty = false;
+    this.lastFlushAt = Date.now();
+  }
+
+  private async markDirty(options?: FlushOptions): Promise<void> {
+    this.dirty = true;
+    this.job.updatedAt = Date.now();
+    if (options?.flush === false) return;
+    await this.flushIfDue();
+  }
+
+  private async flushIfDue(): Promise<void> {
+    if (Date.now() - this.lastFlushAt < JOB_FLUSH_INTERVAL_MS) return;
+    await this.flush();
   }
 }
 
-export async function saveJob(env: AppEnv["Bindings"], job: DeployJob): Promise<void> {
-  job.updatedAt = Date.now();
-  await env.SESSIONS.put(jobKey(job.id), JSON.stringify(job), {
-    expirationTtl: JOB_TTL_SECONDS,
-  });
+export async function createJob(
+  env: AppEnv["Bindings"],
+  input: CreateDeployJobInput,
+): Promise<CreatedDeployJob> {
+  const now = Date.now();
+  const id = randomToken();
+  const viewToken = randomToken();
+  const job: DeployJob = {
+    id,
+    sessionId: input.sessionId,
+    viewTokenHash: await hashJobViewToken(id, viewToken),
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    options: input.options,
+    steps: createDeploySteps(input.options, now),
+    logs: [{ at: now, level: "info", message: "Queued deployment." }],
+  };
+  const credentials = createDeployCredentialRecord(
+    input.token,
+    input.tokenIssuedAt ?? now,
+    input.adapterSecrets,
+  );
+  await deployJobState(env, id).initialize(job, credentials);
+  return { job, viewToken };
 }
 
-export async function appendLog(
+export async function getJob(env: AppEnv["Bindings"], jobId: string): Promise<DeployJob | null> {
+  const current = await deployJobState(env, jobId).getJob();
+  if (current) return current;
+  return (await readLegacyJob(env, jobId))?.job ?? null;
+}
+
+export function appendLog(
   env: AppEnv["Bindings"],
   jobId: string,
   level: "info" | "warning" | "error",
   message: string,
 ): Promise<void> {
-  const job = await getJob(env, jobId);
-  if (!job) return;
-  job.logs.push({ at: Date.now(), level, message });
-  if (job.logs.length > 300) job.logs.splice(0, job.logs.length - 300);
-  await saveJob(env, job);
+  return deployJobState(env, jobId).appendLog(level, message);
 }
 
-export async function updateJob(
-  env: AppEnv["Bindings"],
-  jobId: string,
-  patch: Partial<DeployJob>,
-): Promise<void> {
-  const job = await getJob(env, jobId);
-  if (!job) return;
-  Object.assign(job, patch);
-  await saveJob(env, job);
-}
-
-export async function updateJobStep(
-  env: AppEnv["Bindings"],
-  jobId: string,
-  stepId: DeployStepId,
-  status: DeployStepStatus,
-  detail?: string,
-): Promise<void> {
-  const job = await getJob(env, jobId);
-  if (!job) return;
-  const step = job.steps.find((item) => item.id === stepId);
-  if (!step) return;
-  step.status = status;
-  step.updatedAt = Date.now();
-  if (detail !== undefined) step.detail = detail;
-  await saveJob(env, job);
-}
-
-export async function failActiveJobStep(
+export function markJobStartFailure(
   env: AppEnv["Bindings"],
   jobId: string,
   detail: string,
+  message: string,
 ): Promise<void> {
-  const job = await getJob(env, jobId);
-  if (!job) return;
-  const running = job.steps.find((step) => step.status === "running");
-  const target = running ?? job.steps.find((step) => step.status === "pending") ?? job.steps.at(-1);
-  if (!target) return;
-  target.status = "failed";
-  target.detail = detail;
-  target.updatedAt = Date.now();
-  await saveJob(env, job);
+  return deployJobState(env, jobId).failWorkflowStart(detail, message);
 }
 
-export async function storeDeployToken(
+export async function getDeployCredentials(
   env: AppEnv["Bindings"],
   jobId: string,
-  accessToken: string,
-): Promise<void> {
-  await env.SESSIONS.put(deployTokenKey(jobId), accessToken, {
-    expirationTtl: DEPLOY_TOKEN_TTL_SECONDS,
-  });
+): Promise<ActiveDeployCredentials | null> {
+  const state = deployJobState(env, jobId);
+  let record = await state.getCredentials();
+  if (!record || !record.token.access_token) return null;
+
+  if (shouldRefreshDeployToken(record) && record.token.refresh_token) {
+    const refreshed = await refreshAccessToken(env, record.token.refresh_token);
+    if (!refreshed.access_token) throw new Error("OAuth token refresh returned no access token.");
+    record = createDeployCredentialRecord(
+      {
+        ...record.token,
+        ...refreshed,
+        refresh_token: refreshed.refresh_token ?? record.token.refresh_token,
+      },
+      Date.now(),
+      record.adapterSecrets,
+    );
+    await state.setCredentials(record);
+  }
+
+  if (isAccessTokenExpired(record)) return null;
+  return { ...record.adapterSecrets, accessToken: record.token.access_token };
 }
 
-export async function getDeployToken(
+export async function deleteDeployCredentials(env: AppEnv["Bindings"], jobId: string): Promise<void> {
+  await deployJobState(env, jobId).deleteCredentials();
+  if (await env.SESSIONS.get(legacyDeployTokenKey(jobId))) {
+    await env.SESSIONS.delete(legacyDeployTokenKey(jobId));
+  }
+}
+
+export async function verifyJobViewToken(job: DeployJob, token: string | null): Promise<boolean> {
+  if (!token || !job.viewTokenHash) return false;
+  const hash = await hashJobViewToken(job.id, token);
+  return timingSafeEqual(hash, job.viewTokenHash);
+}
+
+export function toPublicDeployJob(job: DeployJob): PublicDeployJob {
+  const { sessionId: _sessionId, viewTokenHash: _viewTokenHash, ...publicJob } = job;
+  const options = publicJob.options as DeployOptions & DeployAdapterSecrets;
+  const {
+    discordBotToken: _discordBotToken,
+    telegramBotToken: _telegramBotToken,
+    ...publicOptions
+  } = options;
+  return { ...publicJob, options: publicOptions };
+}
+
+function deployJobState(env: AppEnv["Bindings"], jobId: string) {
+  return env.DEPLOY_JOBS.getByName(jobId);
+}
+
+async function getJobForWriter(env: AppEnv["Bindings"], jobId: string): Promise<DeployJob | null> {
+  const state = deployJobState(env, jobId);
+  const current = await state.getJob();
+  if (current) return current;
+
+  const legacy = await readLegacyJob(env, jobId);
+  if (!legacy) return null;
+  const credentials = await readLegacyDeployCredentials(env, jobId, legacy.adapterSecrets);
+  try {
+    await state.initialize(legacy.job, credentials);
+  } catch (error) {
+    const concurrentlyMigrated = await state.getJob();
+    if (concurrentlyMigrated) return concurrentlyMigrated;
+    throw error;
+  }
+  return legacy.job;
+}
+
+async function readLegacyJob(
   env: AppEnv["Bindings"],
   jobId: string,
-): Promise<string | null> {
-  return env.SESSIONS.get(deployTokenKey(jobId));
+): Promise<{ job: DeployJob; adapterSecrets: DeployAdapterSecrets } | null> {
+  const raw = await env.SESSIONS.get(legacyJobKey(jobId));
+  if (!raw) return null;
+
+  try {
+    const job = JSON.parse(raw) as DeployJob;
+    if (!job || job.id !== jobId || !isRecord(job.options)) return null;
+    const options = job.options as DeployOptions & DeployAdapterSecrets;
+    const { discordBotToken, telegramBotToken, ...safeOptions } = options;
+    job.options = safeOptions;
+    if (!Array.isArray(job.steps) || job.steps.length === 0) {
+      job.steps = createDeploySteps(job.options, job.createdAt);
+    }
+    return {
+      job,
+      adapterSecrets: { discordBotToken, telegramBotToken },
+    };
+  } catch {
+    return null;
+  }
 }
 
-export async function deleteDeployToken(
+async function readLegacyDeployCredentials(
   env: AppEnv["Bindings"],
   jobId: string,
-): Promise<void> {
-  await env.SESSIONS.delete(deployTokenKey(jobId));
+  adapterSecrets: DeployAdapterSecrets,
+): Promise<DeployCredentialRecord | null> {
+  const raw = await env.SESSIONS.get(legacyDeployTokenKey(jobId));
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (isRecord(parsed) && isRecord(parsed.token) && typeof parsed.token.access_token === "string") {
+      return {
+        token: parsed.token as TokenResponse,
+        accessTokenExpiresAt: typeof parsed.expiresAt === "number" ? parsed.expiresAt : undefined,
+        adapterSecrets,
+      };
+    }
+    if (isRecord(parsed) && typeof parsed.access_token === "string") {
+      return createDeployCredentialRecord(parsed as TokenResponse, Date.now(), adapterSecrets);
+    }
+  } catch {
+    // The original deployer stored only the access-token string.
+  }
+
+  return {
+    token: { access_token: raw, token_type: "Bearer" },
+    adapterSecrets,
+  };
 }
 
-function jobKey(jobId: string): string {
+function legacyJobKey(jobId: string): string {
   return `deploy-job:${jobId}`;
 }
 
-function deployTokenKey(jobId: string): string {
+function legacyDeployTokenKey(jobId: string): string {
   return `deploy-token:${jobId}`;
 }
 
-function normalizeJob(job: DeployJob): DeployJob {
-  if (!Array.isArray(job.steps) || job.steps.length === 0) {
-    job.steps = createDeploySteps(job.options, job.createdAt);
-  }
-  return job;
+function createDeployCredentialRecord(
+  token: TokenResponse,
+  issuedAt: number,
+  adapterSecrets: DeployAdapterSecrets = {},
+): DeployCredentialRecord {
+  const accessTokenExpiresAt =
+    typeof token.expires_in === "number" && token.expires_in > 0
+      ? issuedAt + token.expires_in * 1000
+      : undefined;
+  return { token, accessTokenExpiresAt, adapterSecrets };
+}
+
+function shouldRefreshDeployToken(record: DeployCredentialRecord): boolean {
+  return (
+    typeof record.accessTokenExpiresAt === "number" &&
+    Date.now() + DEPLOY_TOKEN_REFRESH_LEEWAY_MS >= record.accessTokenExpiresAt
+  );
+}
+
+function isAccessTokenExpired(record: DeployCredentialRecord): boolean {
+  return typeof record.accessTokenExpiresAt === "number" && Date.now() >= record.accessTokenExpiresAt;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+async function hashJobViewToken(jobId: string, token: string): Promise<string> {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${jobId}:${token}`));
+  return hex(bytes);
+}
+
+function hex(buffer: ArrayBuffer): string {
+  return [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function createDeploySteps(options: DeployOptions, now: number): DeployStep[] {
