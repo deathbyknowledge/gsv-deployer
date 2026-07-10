@@ -1,3 +1,5 @@
+import type { DeployJobState } from "./deploy-job";
+
 export type AppEnv = {
   Bindings: {
     APP_ORIGIN: string;
@@ -16,6 +18,8 @@ export type AppEnv = {
     OAUTH_TOKEN_AUTH_METHOD: string;
     SESSION_SECRET: string;
     SESSIONS: KVNamespace;
+    RELEASE_CACHE: R2Bucket;
+    DEPLOY_JOBS: DurableObjectNamespace<DeployJobState>;
     DEPLOY_WORKFLOW: Workflow<DeployWorkflowParams>;
     METRICS: AnalyticsEngineDataset;
   };
@@ -56,8 +60,21 @@ export type DeployOptions = {
   instance: string;
   version: string;
   components: string[];
+};
+
+export type DeployAdapterSecrets = {
   discordBotToken?: string;
   telegramBotToken?: string;
+};
+
+export type DeployCredentialRecord = {
+  token: TokenResponse;
+  accessTokenExpiresAt?: number;
+  adapterSecrets: DeployAdapterSecrets;
+};
+
+export type ActiveDeployCredentials = DeployAdapterSecrets & {
+  accessToken: string;
 };
 
 export type DeployStep = {
@@ -72,6 +89,7 @@ export type DeployStep = {
 export type DeployJob = {
   id: string;
   sessionId: string;
+  viewTokenHash?: string;
   status: DeployStatus;
   createdAt: number;
   updatedAt: number;
@@ -84,6 +102,8 @@ export type DeployJob = {
   };
   error?: string;
 };
+
+export type PublicDeployJob = Omit<DeployJob, "sessionId" | "viewTokenHash">;
 
 export type DeployWorkflowParams = {
   jobId: string;

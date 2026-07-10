@@ -1,11 +1,19 @@
 import { blake3 } from "@noble/hashes/blake3.js";
+import type { WorkflowStep } from "cloudflare:workers";
 import { parse as parseJsonc } from "jsonc-parser";
 import { ungzip } from "pako";
 import { parse as parseToml } from "smol-toml";
 
-import { appendLog, failActiveJobStep, getJob, updateJob, updateJobStep } from "./jobs";
+import { deleteDeployCredentials, DeployJobWriter, getDeployCredentials } from "./jobs";
 import { trackEvent } from "./metrics";
-import type { Account, AppEnv, DeployOptions, DeployStepId, DeployStepStatus } from "./types";
+import type {
+  Account,
+  AppEnv,
+  DeployAdapterSecrets,
+  DeployOptions,
+  DeployStepId,
+  DeployStepStatus,
+} from "./types";
 
 const COMPONENT_GATEWAY = "gateway";
 const COMPONENT_RIPGIT = "ripgit";
@@ -25,6 +33,18 @@ const SCRIPT_CHANNEL_DISCORD = "gsv-channel-discord";
 const SCRIPT_CHANNEL_TELEGRAM = "gsv-channel-telegram";
 const WORKERS_SUBDOMAIN_API_DATE = "2025-08-01";
 const MAX_SOURCE_MAP_UPLOAD_BYTES = 2 * 1024 * 1024;
+const DEPLOY_WORKFLOW_STEP_CONFIG = {
+  timeout: "30 minutes",
+  retries: { limit: 2, delay: "30 seconds", backoff: "linear" },
+} as const;
+const SENSITIVE_DEPLOY_WORKFLOW_STEP_CONFIG = {
+  ...DEPLOY_WORKFLOW_STEP_CONFIG,
+  sensitive: "output",
+} as const;
+const CLEANUP_WORKFLOW_STEP_CONFIG = {
+  timeout: "2 minutes",
+  retries: { limit: 3, delay: "10 seconds", backoff: "linear" },
+} as const;
 
 export const ALL_COMPONENTS = [
   COMPONENT_RIPGIT,
@@ -174,26 +194,66 @@ type TarEntry = {
   bytes: Uint8Array;
 };
 
+type InfoLogger = {
+  info(message: string): Promise<void>;
+};
+
+type DeploymentPlan = {
+  repoOwner: string;
+  repoName: string;
+  version: string;
+  instance: DeployInstance;
+  components: string[];
+  artifactCachePrefix: string;
+};
+
+type DeploymentPreflight = {
+  accountSubdomain: string | null;
+};
+
+type DeploymentResult = {
+  version: string;
+  gatewayUrl?: string;
+};
+
+type DeploymentPhase = {
+  accessToken: string;
+  adapterSecrets: DeployAdapterSecrets;
+  writer: DeployJobWriter;
+  logger: DeployLogger;
+};
+
+type ReleaseArtifactSource =
+  | { kind: "release"; snapshotPrefix: string }
+  | { kind: "snapshot"; snapshotPrefix: string };
+
+type FetchedReleaseAsset = {
+  fileName: string;
+  bytes: Uint8Array;
+  cacheKey?: string;
+};
+
+const SILENT_LOGGER: InfoLogger = {
+  async info() {},
+};
+
 class DeployLogger {
-  constructor(
-    private readonly env: AppEnv["Bindings"],
-    private readonly jobId: string,
-  ) {}
+  constructor(private readonly writer: DeployJobWriter) {}
 
   info(message: string): Promise<void> {
-    return appendLog(this.env, this.jobId, "info", message);
+    return this.writer.appendLog("info", message);
   }
 
   warning(message: string): Promise<void> {
-    return appendLog(this.env, this.jobId, "warning", message);
+    return this.writer.appendLog("warning", message);
   }
 
   error(message: string): Promise<void> {
-    return appendLog(this.env, this.jobId, "error", message);
+    return this.writer.appendLog("error", message);
   }
 
   step(stepId: DeployStepId, status: DeployStepStatus, detail?: string): Promise<void> {
-    return updateJobStep(this.env, this.jobId, stepId, status, detail);
+    return this.writer.updateStep(stepId, status, detail);
   }
 }
 
@@ -255,41 +315,130 @@ export async function findExistingGsvInstallations(
   });
 }
 
-export async function runDeployJob(
+export async function runDeployWorkflow(
   env: AppEnv["Bindings"],
   jobId: string,
-  accessToken: string,
+  step: WorkflowStep,
 ): Promise<void> {
-  const job = await getJob(env, jobId);
-  if (!job) return;
-
-  const logger = new DeployLogger(env, jobId);
-  await updateJob(env, jobId, { status: "running" });
-
-  const account = job.options.accountName || job.options.accountId;
-
   try {
-    const result = await deployGsv(env, job.options, accessToken, logger);
-    await updateJob(env, jobId, { status: "succeeded", result });
-    trackEvent(env, "deploy_success", job.options.version, "", jobId, job.options.instance, account);
-    await logger.info("Deployment complete.");
+    const deploymentPlan = await step.do("prepare deployment", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, async ({ writer, logger }) => {
+        await writer.update({ status: "running" }, { flush: false });
+        return prepareDeploymentPlan(env, jobId, writer.job.options, logger);
+      }),
+    );
+
+    const preflight = await step.do("inspect target and ensure storage", SENSITIVE_DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, ({ accessToken, writer, logger }) =>
+        inspectDeploymentTarget(env, accessToken, writer.job.options.accountId, deploymentPlan, logger),
+      ),
+    );
+
+    await step.do("deploy worker scripts", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
+        await deployWorkerScripts(env, accessToken, writer.job.options.accountId, deploymentPlan, preflight, logger);
+        return { ok: true };
+      }),
+    );
+
+    await step.do("finalize worker bindings", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, async ({ accessToken, writer, logger }) => {
+        await finalizeWorkerBindings(env, accessToken, writer.job.options.accountId, deploymentPlan, preflight, logger);
+        return { ok: true };
+      }),
+    );
+
+    await step.do("configure adapters and finish", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
+      withDeploymentPhase(env, jobId, async ({ accessToken, adapterSecrets, writer, logger }) => {
+        const result = await configureAdaptersAndFinish(
+          accessToken,
+          writer.job.options,
+          adapterSecrets,
+          deploymentPlan,
+          preflight,
+          logger,
+        );
+        await recordDeploymentSuccess(env, writer, result);
+        return result;
+      }),
+    );
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await failActiveJobStep(env, jobId, friendlyErrorDetail(message));
-    await logger.error(message);
-    await updateJob(env, jobId, { status: "failed", error: message });
-    trackEvent(env, "deploy_failed", job.options.version, "", jobId, job.options.instance, account);
+    try {
+      await step.do("record deployment failure", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
+        await recordDeploymentFailure(env, jobId, error);
+        return { ok: true };
+      });
+    } catch (recordError) {
+      logWorkflowMaintenanceError(jobId, "record deployment failure", recordError);
+    }
     if (error instanceof Error) throw error;
-    throw new Error(message);
+    throw new Error(String(error));
+  } finally {
+    try {
+      await step.do("cleanup deployment credentials", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
+        await deleteDeployCredentials(env, jobId);
+        return { ok: true };
+      });
+    } catch (error) {
+      logWorkflowMaintenanceError(jobId, "cleanup deployment credentials", error);
+    }
+
+    try {
+      await step.do("cleanup deployment artifacts", CLEANUP_WORKFLOW_STEP_CONFIG, async () => {
+        await cleanupDeploymentArtifactPrefix(env, deploymentArtifactCachePrefix(jobId), SILENT_LOGGER, true);
+        return { ok: true };
+      });
+    } catch (error) {
+      logWorkflowMaintenanceError(jobId, "cleanup deployment artifacts", error);
+    }
   }
 }
 
-async function deployGsv(
+async function withDeploymentPhase<T>(
   env: AppEnv["Bindings"],
+  jobId: string,
+  callback: (phase: DeploymentPhase) => Promise<T>,
+): Promise<T> {
+  const phase = await loadDeploymentPhase(env, jobId);
+  try {
+    return await callback(phase);
+  } finally {
+    await phase.writer.flush();
+  }
+}
+
+async function loadDeploymentPhase(env: AppEnv["Bindings"], jobId: string): Promise<DeploymentPhase> {
+  const writer = await DeployJobWriter.load(env, jobId);
+  if (!writer) throw new Error(`Deployment job ${jobId} was not found.`);
+
+  const credentials = await getDeployCredentials(env, jobId);
+  if (!credentials) throw new Error("Deployment credentials expired. Please authorize Cloudflare again.");
+
+  return {
+    accessToken: credentials.accessToken,
+    adapterSecrets: {
+      discordBotToken: credentials.discordBotToken,
+      telegramBotToken: credentials.telegramBotToken,
+    },
+    writer,
+    logger: new DeployLogger(writer),
+  };
+}
+
+function logWorkflowMaintenanceError(jobId: string, operation: string, error: unknown): void {
+  console.error(JSON.stringify({
+    error: error instanceof Error ? error.message : String(error),
+    jobId,
+    message: `Workflow maintenance step failed: ${operation}`,
+  }));
+}
+
+async function prepareDeploymentPlan(
+  env: AppEnv["Bindings"],
+  jobId: string,
   options: DeployOptions,
-  accessToken: string,
   logger: DeployLogger,
-): Promise<{ version: string; gatewayUrl?: string }> {
+): Promise<DeploymentPlan> {
   const instance = parseInstance(options.instance);
   const components = normalizeComponents(options.components).sort((a, b) => deployOrder(a) - deployOrder(b));
   if (components.length === 0) throw new Error("No components selected.");
@@ -302,41 +451,68 @@ async function deployGsv(
   await logger.info(`Preparing ${components.join(", ")} from ${version}.`);
 
   await logger.step("prepare", "running", `Downloading and verifying ${formatCount(components.length, "component")}.`);
-  const prepared = await prepareBundles(repoOwner, repoName, version, components, instance, logger);
+  const artifactCachePrefix = deploymentArtifactCachePrefix(jobId);
+  await prepareBundles(env, repoOwner, repoName, version, components, instance, logger, {
+    kind: "release",
+    snapshotPrefix: artifactCachePrefix,
+  });
   await logger.step("prepare", "complete", "GSV components are verified and ready.");
 
-  const selectedComponents = new Set(components);
-  const gatewayScriptName = scriptNameForComponent(instance, COMPONENT_GATEWAY);
-  const ripgitScriptName = scriptNameForComponent(instance, COMPONENT_RIPGIT);
-  const assemblerScriptName = scriptNameForComponent(instance, COMPONENT_ASSEMBLER);
+  return { repoOwner, repoName, version, instance, components, artifactCachePrefix };
+}
 
-  const existingScriptsWithMigrations = await listWorkerScripts(accessToken, options.accountId);
+async function inspectDeploymentTarget(
+  env: AppEnv["Bindings"],
+  accessToken: string,
+  accountId: string,
+  plan: DeploymentPlan,
+  logger: DeployLogger,
+): Promise<DeploymentPreflight> {
+  const selectedComponents = new Set(plan.components);
+  const existingScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
   const existingScripts = new Set([...existingScriptsWithMigrations.keys()]);
-
-  if (selectedComponents.has(COMPONENT_GATEWAY) && !selectedComponents.has(COMPONENT_RIPGIT) && !existingScripts.has(ripgitScriptName)) {
-    throw new Error("Deploying gateway requires ripgit. Select ripgit or deploy it first.");
-  }
-  if (selectedComponents.has(COMPONENT_GATEWAY) && !selectedComponents.has(COMPONENT_ASSEMBLER) && !existingScripts.has(assemblerScriptName)) {
-    throw new Error("Deploying gateway requires assembler. Select assembler or deploy it first.");
-  }
+  assertGatewayDependenciesAvailable(
+    selectedComponents,
+    selectedOrExistingScripts(selectedComponents, existingScripts, plan.instance),
+    plan.instance,
+  );
 
   await logger.step("storage", "running", "Checking Cloudflare storage resources.");
-  await ensureStorageResources(accessToken, options.accountId, prepared, logger);
+  const prepared = await prepareBundlesForPhase(env, plan, logger, "Loading verified bundles for storage checks.");
+  await ensureStorageResources(accessToken, accountId, prepared, logger);
   await logger.step("storage", "complete", "Storage resources are ready.");
 
-  const accountSubdomain = await fetchAccountWorkersSubdomain(accessToken, options.accountId, logger);
-  const uploadedAssetsByScript = new Map<string, UploadedAssets>();
-  const availableScripts = new Set(existingScripts);
+  const accountSubdomain = await fetchAccountWorkersSubdomain(accessToken, accountId, logger);
+  return { accountSubdomain };
+}
+
+async function deployWorkerScripts(
+  env: AppEnv["Bindings"],
+  accessToken: string,
+  accountId: string,
+  plan: DeploymentPlan,
+  preflight: DeploymentPreflight,
+  logger: DeployLogger,
+): Promise<void> {
+  const prepared = await prepareBundlesForPhase(env, plan, logger, "Loading verified bundles for Worker upload.");
+  const selectedComponents = new Set(plan.components);
+  const existingScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
+  const accountSubdomain = preflight.accountSubdomain;
+  assertGatewayDependenciesAvailable(
+    selectedComponents,
+    selectedOrExistingScripts(selectedComponents, new Set(existingScriptsWithMigrations.keys()), plan.instance),
+    plan.instance,
+  );
+  const availableScripts = new Set(existingScriptsWithMigrations.keys());
 
   await logger.step("workers", "running", `Uploading ${formatCount(prepared.length, "Worker")}.`);
   await logger.info("Deploying workers (pass 1/2).");
   for (const bundle of prepared) {
     await logger.info(`Deploying ${bundle.component} (${bundle.scriptName}).`);
-    const uploadedAssets = await syncAssetsForBundle(accessToken, options.accountId, bundle, logger);
-    if (uploadedAssets) uploadedAssetsByScript.set(bundle.scriptName, uploadedAssets);
+    const uploadedAssets = await syncAssetsForBundle(accessToken, accountId, bundle, logger);
 
-    const metadata = await buildUploadMetadata(accessToken, options.accountId, bundle, {
-      instance,
+    const metadata = await buildUploadMetadata(accessToken, accountId, bundle, {
+      instance: plan.instance,
       selectedComponents,
       availableScripts,
       accountSubdomain,
@@ -347,19 +523,38 @@ async function deployGsv(
       keepAssets: false,
       logger,
     });
-    await uploadWorkerScript(accessToken, options.accountId, bundle, metadata, false);
+    await uploadWorkerScript(accessToken, accountId, bundle, metadata, false);
     await logger.info(`Uploaded ${bundle.scriptName}.`);
     availableScripts.add(bundle.scriptName);
-    await enableWorkersDev(accessToken, options.accountId, bundle.scriptName, logger);
+    await enableWorkersDev(accessToken, accountId, bundle.scriptName, logger);
   }
   await logger.step("workers", "complete", "Workers and assets are deployed.");
+}
+
+async function finalizeWorkerBindings(
+  env: AppEnv["Bindings"],
+  accessToken: string,
+  accountId: string,
+  plan: DeploymentPlan,
+  preflight: DeploymentPreflight,
+  logger: DeployLogger,
+): Promise<void> {
+  const prepared = await prepareBundlesForPhase(env, plan, logger, "Loading verified bundles for binding finalization.");
+  const selectedComponents = new Set(plan.components);
+  const currentScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
+  const availableScripts = new Set(currentScriptsWithMigrations.keys());
+  for (const component of selectedComponents) {
+    availableScripts.add(scriptNameForComponent(plan.instance, component));
+  }
+  assertGatewayDependenciesAvailable(selectedComponents, availableScripts, plan.instance);
+  const accountSubdomain = preflight.accountSubdomain;
 
   await logger.step("bindings", "running", "Connecting GSV services.");
   await logger.info("Finalizing service bindings (pass 2/2).");
   for (const bundle of prepared) {
     await logger.info(`Finalizing ${bundle.component} (${bundle.scriptName}).`);
-    const metadata = await buildUploadMetadata(accessToken, options.accountId, bundle, {
-      instance,
+    const metadata = await buildUploadMetadata(accessToken, accountId, bundle, {
+      instance: plan.instance,
       selectedComponents,
       availableScripts,
       accountSubdomain,
@@ -370,36 +565,49 @@ async function deployGsv(
       keepAssets: hasAssets(bundle),
       logger,
     });
-    await uploadWorkerScript(accessToken, options.accountId, bundle, metadata, true);
+    await uploadWorkerScript(accessToken, accountId, bundle, metadata, true);
     await logger.info(`Updated bindings for ${bundle.scriptName}.`);
   }
   await logger.step("bindings", "complete", "GSV services are connected.");
+}
+
+async function configureAdaptersAndFinish(
+  accessToken: string,
+  options: DeployOptions,
+  adapterSecrets: DeployAdapterSecrets,
+  plan: DeploymentPlan,
+  preflight: DeploymentPreflight,
+  logger: DeployLogger,
+): Promise<DeploymentResult> {
+  const selectedComponents = new Set(plan.components);
+  const accountSubdomain = preflight.accountSubdomain;
+  const gatewayScriptName = scriptNameForComponent(plan.instance, COMPONENT_GATEWAY);
 
   const hasChannelComponents = [...selectedComponents].some((component) => component.startsWith("channel-"));
   if (hasChannelComponents) {
     await logger.step("adapters", "running", "Applying channel configuration.");
   }
   const adapterNotes: string[] = [];
-  if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD) && options.discordBotToken) {
+  if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD) && adapterSecrets.discordBotToken) {
     await setWorkerSecret(
       accessToken,
       options.accountId,
-      scriptNameForComponent(instance, COMPONENT_CHANNEL_DISCORD),
+      scriptNameForComponent(plan.instance, COMPONENT_CHANNEL_DISCORD),
       "DISCORD_BOT_TOKEN",
-      options.discordBotToken,
+      adapterSecrets.discordBotToken,
     );
     await logger.info("Configured DISCORD_BOT_TOKEN.");
   } else if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD)) {
     adapterNotes.push("Discord needs a bot token before it can receive messages.");
   }
 
-  if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && options.telegramBotToken) {
+  if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && adapterSecrets.telegramBotToken) {
     await setWorkerSecret(
       accessToken,
       options.accountId,
-      scriptNameForComponent(instance, COMPONENT_CHANNEL_TELEGRAM),
+      scriptNameForComponent(plan.instance, COMPONENT_CHANNEL_TELEGRAM),
       "TELEGRAM_BOT_TOKEN",
-      options.telegramBotToken,
+      adapterSecrets.telegramBotToken,
     );
     await logger.info("Configured TELEGRAM_BOT_TOKEN.");
   } else if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM)) {
@@ -432,7 +640,56 @@ async function deployGsv(
         : "Selected components are deployed.",
   );
 
-  return { version, gatewayUrl };
+  return { version: plan.version, gatewayUrl };
+}
+
+async function prepareBundlesForPhase(
+  env: AppEnv["Bindings"],
+  plan: DeploymentPlan,
+  logger: DeployLogger,
+  message: string,
+): Promise<PreparedBundle[]> {
+  await logger.info(message);
+  return prepareBundles(env, plan.repoOwner, plan.repoName, plan.version, plan.components, plan.instance, SILENT_LOGGER, {
+    kind: "snapshot",
+    snapshotPrefix: plan.artifactCachePrefix,
+  });
+}
+
+async function recordDeploymentSuccess(
+  env: AppEnv["Bindings"],
+  writer: DeployJobWriter,
+  result: DeploymentResult,
+): Promise<void> {
+  const account = writer.job.options.accountName || writer.job.options.accountId;
+  await writer.update({ status: "succeeded", result }, { flush: false });
+  await writer.appendLog("info", "Deployment complete.", { flush: false });
+  trackEvent(env, "deploy_success", writer.job.options.version, "", writer.job.id, writer.job.options.instance, account);
+  await writer.flush(true);
+}
+
+async function recordDeploymentFailure(env: AppEnv["Bindings"], jobId: string, error: unknown): Promise<void> {
+  const writer = await DeployJobWriter.load(env, jobId);
+  if (!writer) return;
+  await recordDeploymentFailureWithWriter(env, writer, error);
+}
+
+async function recordDeploymentFailureWithWriter(
+  env: AppEnv["Bindings"],
+  writer: DeployJobWriter,
+  error: unknown,
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  if (writer.job.status === "failed" && writer.job.error === message) {
+    return;
+  }
+
+  const account = writer.job.options.accountName || writer.job.options.accountId;
+  await writer.failActiveStep(friendlyErrorDetail(message), { flush: false });
+  await writer.appendLog("error", message, { flush: false });
+  await writer.update({ status: "failed", error: message }, { flush: false });
+  trackEvent(env, "deploy_failed", writer.job.options.version, "", writer.job.id, writer.job.options.instance, account);
+  await writer.flush(true);
 }
 
 function normalizeComponents(raw: string[]): string[] {
@@ -630,6 +887,32 @@ function scriptNameForComponent(instance: DeployInstance, component: string): st
   }
 }
 
+function selectedOrExistingScripts(
+  selectedComponents: Set<string>,
+  existingScripts: Set<string>,
+  instance: DeployInstance,
+): Set<string> {
+  const scripts = new Set(existingScripts);
+  for (const component of selectedComponents) {
+    scripts.add(scriptNameForComponent(instance, component));
+  }
+  return scripts;
+}
+
+function assertGatewayDependenciesAvailable(
+  selectedComponents: Set<string>,
+  availableScripts: Set<string>,
+  instance: DeployInstance,
+): void {
+  if (!selectedComponents.has(COMPONENT_GATEWAY)) return;
+  if (!availableScripts.has(scriptNameForComponent(instance, COMPONENT_RIPGIT))) {
+    throw new Error("Deploying gateway requires ripgit. Select ripgit or deploy it first.");
+  }
+  if (!availableScripts.has(scriptNameForComponent(instance, COMPONENT_ASSEMBLER))) {
+    throw new Error("Deploying gateway requires assembler. Select assembler or deploy it first.");
+  }
+}
+
 function scriptNameForConfigService(instance: DeployInstance, service: string): string {
   switch (service) {
     case SCRIPT_GATEWAY:
@@ -653,7 +936,7 @@ async function resolveReleaseTag(
   repoOwner: string,
   repoName: string,
   version: string,
-  logger: DeployLogger,
+  logger: InfoLogger,
 ): Promise<string> {
   const normalized = version.trim().toLowerCase() || "latest";
   if (normalized === "latest" || normalized === "stable") {
@@ -730,41 +1013,255 @@ function githubApiHeaders(env: AppEnv["Bindings"]): HeadersInit {
 }
 
 async function prepareBundles(
+  env: AppEnv["Bindings"],
   repoOwner: string,
   repoName: string,
   version: string,
   components: string[],
   instance: DeployInstance,
-  logger: DeployLogger,
+  logger: InfoLogger,
+  source: ReleaseArtifactSource,
 ): Promise<PreparedBundle[]> {
   const checksumsUrl = releaseDownloadUrl(repoOwner, repoName, version, BUNDLE_CHECKSUMS);
   await logger.info(`Fetching checksums from ${checksumsUrl}.`);
-  const checksumsText = await fetchText(checksumsUrl, "Fetch bundle checksums");
+  const checksumsAsset = await fetchReleaseAsset(env, repoOwner, repoName, version, BUNDLE_CHECKSUMS, "Fetch bundle checksums", logger, source);
+  const checksumsText = decodeText(checksumsAsset.bytes);
   const checksums = parseChecksums(checksumsText);
   const bundles: PreparedBundle[] = [];
+  const validatedAssets: FetchedReleaseAsset[] = [checksumsAsset];
 
   for (const component of components) {
     const bundleFile = COMPONENT_TO_BUNDLE[component];
     const expected = checksums.get(bundleFile);
     if (!expected) throw new Error(`Missing checksum entry for ${bundleFile}.`);
 
-    const url = releaseDownloadUrl(repoOwner, repoName, version, bundleFile);
     await logger.info(`Downloading ${component} bundle.`);
-    const bytes = await fetchBytes(url, `Download ${component} bundle`);
+    const bundleAsset = await fetchReleaseAsset(env, repoOwner, repoName, version, bundleFile, `Download ${component} bundle`, logger, source);
+    const bytes = bundleAsset.bytes;
     const actual = await sha256Hex(bytes);
     if (actual !== expected) {
       throw new Error(`Checksum mismatch for ${bundleFile}: expected ${expected}, got ${actual}.`);
     }
     await logger.info(`Checksum OK for ${bundleFile}.`);
     bundles.push(await prepareBundle(component, bytes, instance));
+    validatedAssets.push(bundleAsset);
   }
 
+  await cacheValidatedReleaseAssets(env, repoOwner, repoName, version, source, validatedAssets, logger);
   return bundles.sort((a, b) => deployOrder(a.component) - deployOrder(b.component));
 }
 
 function releaseDownloadUrl(repoOwner: string, repoName: string, tag: string, fileName: string): string {
   const base = `https://github.com/${repoOwner}/${repoName}/releases/download/${tag}/${fileName}`;
   return tag.toLowerCase() === "dev" ? `${base}?ts=${Date.now()}` : base;
+}
+
+async function fetchReleaseAsset(
+  env: AppEnv["Bindings"],
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  fileName: string,
+  context: string,
+  logger: InfoLogger,
+  source: ReleaseArtifactSource,
+): Promise<FetchedReleaseAsset> {
+  if (source.kind === "snapshot") {
+    return {
+      fileName,
+      bytes: await readRequiredReleaseAssetCache(
+        env.RELEASE_CACHE,
+        deploymentArtifactCacheKey(source.snapshotPrefix, fileName),
+        fileName,
+      ),
+    };
+  }
+
+  const url = releaseDownloadUrl(repoOwner, repoName, version, fileName);
+  let cacheKey: string | undefined;
+
+  if (shouldCacheReleaseAsset(version)) {
+    cacheKey = releaseCacheKey(repoOwner, repoName, version, fileName);
+    const cached = await readReleaseAssetCache(env.RELEASE_CACHE, cacheKey, fileName, logger);
+    if (cached) return { fileName, bytes: cached };
+  }
+
+  return { fileName, bytes: await fetchBytes(url, context), cacheKey };
+}
+
+function shouldCacheReleaseAsset(version: string): boolean {
+  // The dev channel is mutable and intentionally cache-busted at the GitHub URL level.
+  return version.trim().toLowerCase() !== "dev";
+}
+
+function releaseCacheKey(repoOwner: string, repoName: string, version: string, fileName: string): string {
+  return [
+    "github",
+    encodeURIComponent(repoOwner),
+    encodeURIComponent(repoName),
+    "releases",
+    encodeURIComponent(version),
+    encodeURIComponent(fileName),
+  ].join("/");
+}
+
+function deploymentArtifactCachePrefix(jobId: string): string {
+  return ["deployments", encodeURIComponent(jobId), "release-artifacts"].join("/");
+}
+
+function deploymentArtifactCacheKey(prefix: string, fileName: string): string {
+  return `${prefix}/${encodeURIComponent(fileName)}`;
+}
+
+async function readRequiredReleaseAssetCache(
+  cache: R2Bucket,
+  key: string,
+  fileName: string,
+): Promise<Uint8Array> {
+  try {
+    const object = await cache.get(key);
+    if (!object) throw new Error("object not found");
+    return new Uint8Array(await object.arrayBuffer());
+  } catch (error) {
+    throw new Error(`Verified deployment artifact ${fileName} is unavailable in R2: ${errorMessage(error)}`);
+  }
+}
+
+async function readReleaseAssetCache(
+  cache: R2Bucket,
+  key: string,
+  fileName: string,
+  logger: InfoLogger,
+): Promise<Uint8Array | null> {
+  try {
+    const object = await cache.get(key);
+    if (!object) return null;
+    await logger.info(`Release cache hit for ${fileName}.`);
+    return new Uint8Array(await object.arrayBuffer());
+  } catch (error) {
+    await logger.info(`Release cache read failed for ${fileName}: ${errorMessage(error)}. Falling back to GitHub.`);
+    return null;
+  }
+}
+
+async function writeDeploymentArtifactCache(
+  cache: R2Bucket,
+  prefix: string,
+  fileName: string,
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  await cache.put(deploymentArtifactCacheKey(prefix, fileName), bytes, {
+    httpMetadata: { contentType: releaseAssetContentType(fileName) },
+    customMetadata: {
+      source: "deployment-release-artifact",
+      repo: `${repoOwner}/${repoName}`,
+      version,
+      file: fileName,
+      cached_at: new Date().toISOString(),
+    },
+  });
+}
+
+async function cacheValidatedReleaseAssets(
+  env: AppEnv["Bindings"],
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  source: ReleaseArtifactSource,
+  assets: FetchedReleaseAsset[],
+  logger: InfoLogger,
+): Promise<void> {
+  if (source.kind !== "release") return;
+
+  for (const asset of assets) {
+    await writeDeploymentArtifactCache(
+      env.RELEASE_CACHE,
+      source.snapshotPrefix,
+      asset.fileName,
+      repoOwner,
+      repoName,
+      version,
+      asset.bytes,
+    );
+    if (asset.cacheKey) {
+      await writeReleaseAssetCache(
+        env.RELEASE_CACHE,
+        asset.cacheKey,
+        asset.fileName,
+        repoOwner,
+        repoName,
+        version,
+        asset.bytes,
+        logger,
+      );
+    }
+  }
+}
+
+async function writeReleaseAssetCache(
+  cache: R2Bucket,
+  key: string,
+  fileName: string,
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  bytes: Uint8Array,
+  logger: InfoLogger,
+): Promise<void> {
+  try {
+    await cache.put(key, bytes, {
+      httpMetadata: { contentType: releaseAssetContentType(fileName) },
+      customMetadata: {
+        source: "github-release",
+        repo: `${repoOwner}/${repoName}`,
+        version,
+        file: fileName,
+        cached_at: new Date().toISOString(),
+      },
+    });
+    await logger.info(`Cached ${fileName} in release cache.`);
+  } catch (error) {
+    await logger.info(`Release cache write failed for ${fileName}: ${errorMessage(error)}. Continuing with GitHub bytes.`);
+  }
+}
+
+function releaseAssetContentType(fileName: string): string {
+  if (fileName.endsWith(".tar.gz")) return "application/gzip";
+  if (fileName.endsWith(".txt")) return "text/plain; charset=utf-8";
+  return "application/octet-stream";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function cleanupDeploymentArtifactPrefix(
+  env: AppEnv["Bindings"],
+  artifactCachePrefix: string,
+  logger: InfoLogger,
+  throwOnError = false,
+): Promise<void> {
+  try {
+    let cursor: string | undefined;
+    do {
+      const listed = await env.RELEASE_CACHE.list({
+        prefix: `${artifactCachePrefix}/`,
+        cursor,
+      });
+      const keys = listed.objects.map((object) => object.key);
+      for (let i = 0; i < keys.length; i += 1000) {
+        const batch = keys.slice(i, i + 1000);
+        if (batch.length) await env.RELEASE_CACHE.delete(batch);
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  } catch (error) {
+    await logger.info(`Failed to clean up deployment release artifacts: ${errorMessage(error)}.`);
+    if (throwOnError) throw error;
+  }
 }
 
 function parseChecksums(content: string): Map<string, string> {
@@ -1422,12 +1919,6 @@ function readFile(files: Map<string, Uint8Array>, path: string): Uint8Array {
   const file = files.get(normalizePath(path));
   if (!file) throw new Error(`Bundle file missing: ${path}`);
   return file;
-}
-
-async function fetchText(url: string, context: string): Promise<string> {
-  const response = await fetch(url, { headers: { "User-Agent": "gsv-deployment" } });
-  if (!response.ok) throw new Error(`${context} failed (${response.status}).`);
-  return response.text();
 }
 
 async function fetchBytes(url: string, context: string): Promise<Uint8Array> {
