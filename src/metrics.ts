@@ -124,15 +124,15 @@ export async function fetchRecentDeploys(env: AppEnv["Bindings"]): Promise<Metri
   }>(
     env,
     `SELECT blob4 AS job_id,
-            max(blob5) AS instance,
-            max(blob6) AS account,
-            max(blob2) AS release,
+            blob5 AS instance,
+            blob6 AS account,
+            blob2 AS release,
             countIf(blob1 = 'deploy_success') AS succeeded,
             countIf(blob1 = 'deploy_failed') AS failed,
             max(timestamp) AS last_at
      FROM gsv_deploy_metrics
      WHERE blob1 IN ('deploy_submit', 'deploy_success', 'deploy_failed') AND blob4 != ''
-     GROUP BY job_id
+     GROUP BY job_id, instance, account, release
      ORDER BY last_at DESC
      LIMIT 20`,
   );
