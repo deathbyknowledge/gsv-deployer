@@ -138,6 +138,10 @@ type WranglerConfig = {
     run_worker_first?: unknown;
   };
   observability?: unknown;
+  limits?: {
+    cpu_ms?: number;
+    subrequests?: number;
+  };
 };
 
 type PreparedBundle = {
@@ -1498,10 +1502,10 @@ type MetadataOptions = {
   scriptExists: boolean;
   uploadedAssets: UploadedAssets | null;
   keepAssets: boolean;
-  logger: DeployLogger;
+  logger: InfoLogger;
 };
 
-async function buildUploadMetadata(
+export async function buildUploadMetadata(
   accessToken: string,
   accountId: string,
   bundle: PreparedBundle,
@@ -1598,6 +1602,7 @@ async function buildUploadMetadata(
     }
   }
   if (bundle.wrangler.observability) metadata.observability = bundle.wrangler.observability;
+  if (bundle.wrangler.limits) metadata.limits = bundle.wrangler.limits;
   if (options.uploadedAssets) {
     metadata.assets = { jwt: options.uploadedAssets.jwt, config: options.uploadedAssets.config };
   }
