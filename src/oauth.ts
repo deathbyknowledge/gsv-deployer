@@ -66,7 +66,9 @@ export async function handleCallback(c: Context<AppEnv>): Promise<Response> {
   });
 
   const cookieValue = await signSessionId(c.env.SESSION_SECRET, sessionId);
-  return redirectWithCookies("/deploy", [
+  // Land on the manage dashboard: the GSV overview, including an empty state
+  // that points first-time users at the deploy form.
+  return redirectWithCookies("/manage", [
     clearCookie(STATE_COOKIE),
     setCookie(SESSION_COOKIE, cookieValue, SESSION_TTL_SECONDS),
   ]);

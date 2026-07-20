@@ -59,6 +59,7 @@
 		}
 	],
 	"vars": {
+		"ENVIRONMENT": "production",
 		"APP_ORIGIN": "https://deploy.gsv.space",
 		"CF_ACCOUNT_ID": "f7c938a773193df3a4ac230b24bc8259",
 		"GSV_REPO_OWNER": "deathbyknowledge",
