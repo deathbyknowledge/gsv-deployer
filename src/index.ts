@@ -3,7 +3,7 @@ import { Hono } from "hono";
 export { GsvDeployWorkflow } from "./workflow";
 export { DeployJobState } from "./deploy-job";
 
-import { ALL_COMPONENTS, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
+import { ALL_COMPONENTS, deleteGsvInstallation, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
 import departureMonoWoff2 from "./assets/departure-mono.woff2";
 import { ANALYTICS_SCRIPT } from "./analytics";
 import {
@@ -18,7 +18,8 @@ import {
 import { getCookie, setCookie } from "./cookies";
 import { page } from "./html";
 import { fetchAccounts, getSessionWithId, handleCallback, logout, requireSession, startLogin } from "./oauth";
-import { deployPage, errorPage, homePage, jobPage, metricsPage, noAccountsPage } from "./pages";
+import { confirmDeletePage, deployPage, errorPage, homePage, jobPage, managePage, metricsPage, noAccountsPage } from "./pages";
+import type { DeployPrefill } from "./pages";
 import {
   fetchMetricsByCountry,
   fetchMetricsByHour,
@@ -64,7 +65,7 @@ app.get("/assets/analytics.js", () => {
 
 app.get("/", async (c) => {
   const session = await getSessionWithId(c);
-  if (session) return c.redirect("/deploy");
+  if (session) return c.redirect("/manage");
   return page(c, {
     title: "Deploy GSV",
     body: homePage(c.env.GITHUB_REPO_URL),
@@ -73,7 +74,7 @@ app.get("/", async (c) => {
 
 app.get("/login", (c) => {
   const referer = c.req.header("referer") ?? "";
-  const isSessionExpiredRedirect = referer.includes("/deploy") || referer.includes("/jobs/");
+  const isSessionExpiredRedirect = referer.includes("/deploy") || referer.includes("/jobs/") || referer.includes("/manage");
   trackRequestEvent(c.env, c.req.raw, "login_view", isSessionExpiredRedirect ? "session_expired" : "cta", requestCountry(c.req.raw));
   return startLogin(c);
 });
@@ -81,6 +82,91 @@ app.get("/login", (c) => {
 app.get("/oauth/callback", (c) => handleCallback(c));
 
 app.get("/logout", (c) => logout(c));
+
+app.get("/manage", async (c) => {
+  let session;
+  try {
+    session = await requireSession(c);
+  } catch {
+    return c.redirect("/login");
+  }
+
+  const accounts = await fetchAccounts(session.session.token.access_token);
+  const installations = await findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []);
+  // The overview is always the landing page after login, including the empty
+  // state that points first-time users at the deploy form.
+  return page(c, {
+    title: "Your GSVs",
+    body: managePage(installations),
+    width: "wide",
+  });
+});
+
+app.get("/manage/delete", async (c) => {
+  let session;
+  try {
+    session = await requireSession(c);
+  } catch {
+    return c.redirect("/login");
+  }
+
+  const accountId = c.req.query("accountId") ?? "";
+  const instance = c.req.query("instance") ?? "";
+  const accounts = await fetchAccounts(session.session.token.access_token);
+  const installations = await findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []);
+  const install = installations.find((item) => item.accountId === accountId && item.instance === instance);
+  if (!install) return c.redirect("/manage");
+
+  return page(c, {
+    title: `Delete ${install.instance}`,
+    body: confirmDeletePage(install),
+    width: "wide",
+  });
+});
+
+app.post("/manage/delete", async (c) => {
+  let session;
+  try {
+    session = await requireSession(c);
+  } catch {
+    return c.redirect("/login");
+  }
+
+  const form = await c.req.formData();
+  const accountId = stringField(form, "accountId");
+  const instance = stringField(form, "instance");
+  const accounts = await fetchAccounts(session.session.token.access_token);
+  // Re-detect server-side so we only ever delete Worker scripts that belong to a
+  // GSV install in one of this session's authorized accounts.
+  const installations = await findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []);
+  const install = installations.find((item) => item.accountId === accountId && item.instance === instance);
+  if (!install) return c.redirect("/manage");
+
+  const deleteStorage = stringField(form, "deleteStorage") === "1";
+  const result = await deleteGsvInstallation(session.session.token.access_token, install, { deleteStorage });
+  if (result.failed.length > 0) {
+    const scripts = result.failed.map((entry) => entry.script).join(", ");
+    return page(c, {
+      title: "Delete failed",
+      body: errorPage(
+        "Could not fully delete",
+        `Some Workers for ${install.instance} could not be deleted (${scripts}): ${result.failed[0].error}. Any remaining Workers are shown back on your GSVs overview.`,
+      ),
+      status: 502,
+    });
+  }
+  if (result.storage && !result.storage.deleted) {
+    return page(c, {
+      title: "Storage not deleted",
+      body: errorPage(
+        "Workers deleted, storage kept",
+        `The Workers for ${install.instance} were deleted, but the R2 bucket ${result.storage.name} could not be removed: ${result.storage.error}. If it still contains files, empty it in the Cloudflare dashboard and delete the bucket there.`,
+      ),
+      status: 502,
+    });
+  }
+  return c.redirect("/manage");
+});
 
 app.get("/deploy", async (c) => {
   let session;
@@ -96,9 +182,10 @@ app.get("/deploy", async (c) => {
     fetchReleaseOptions(c.env).catch(() => []),
     findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []),
   ]);
+  const prefill = parseDeployPrefill(c.req.query());
   return page(c, {
     title: "Deploy GSV",
-    body: accounts.length > 0 ? deployPage(accounts, c.env.OAUTH_SCOPES, releases, installations) : noAccountsPage(),
+    body: accounts.length > 0 ? deployPage(accounts, c.env.OAUTH_SCOPES, releases, installations, prefill) : noAccountsPage(),
     width: "wide",
   });
 });
@@ -254,6 +341,129 @@ app.get("/metrics", async (c) => {
 
 app.get("/health", (c) => c.json({ ok: true }));
 
+// TEMP PREVIEW ROUTE — remove after review.
+app.get("/preview/:kind", (c) => {
+  const kind = c.req.param("kind");
+  const previewInstalls = [
+    { accountId: "acc1", accountName: "My Cloudflare", instance: "gsv", components: ["gateway", "ripgit", "assembler"], scriptNames: [] },
+    { accountId: "acc2", accountName: "Other account", instance: "gsv-work", components: ["gateway", "ripgit", "assembler", "channel-discord"], scriptNames: [] },
+  ];
+  if (kind === "manage") {
+    return page(c, { title: "Your GSVs", body: managePage(previewInstalls), width: "wide" });
+  }
+  if (kind === "manage-empty") {
+    return page(c, { title: "Your GSVs", body: managePage([]), width: "wide" });
+  }
+  if (kind === "delete") {
+    return page(c, {
+      title: "Delete gsv-work",
+      body: confirmDeletePage({
+        accountId: "acc2",
+        accountName: "Other account",
+        instance: "gsv-work",
+        components: ["gateway", "ripgit", "assembler", "channel-discord"],
+        scriptNames: ["gsv-work", "gsv-work-ripgit", "gsv-work-assembler", "gsv-work-channel-discord"],
+      }),
+      width: "wide",
+    });
+  }
+  if (kind === "update-form") {
+    return page(c, {
+      title: "Deploy GSV",
+      body: deployPage(
+        [
+          { id: "acc1", name: "My Cloudflare" },
+          { id: "acc2", name: "Other account" },
+        ] as unknown as Parameters<typeof deployPage>[0],
+        c.env.OAUTH_SCOPES,
+        [],
+        previewInstalls,
+        { mode: "update", accountId: "acc2", instance: "gsv-work", components: ["gateway", "ripgit", "assembler", "channel-discord"] },
+      ),
+      width: "wide",
+    });
+  }
+  if (kind === "retry-form") {
+    return page(c, {
+      title: "Deploy GSV",
+      body: deployPage(
+        [
+          { id: "acc1", name: "My Cloudflare" },
+          { id: "acc2", name: "Other account" },
+        ] as unknown as Parameters<typeof deployPage>[0],
+        c.env.OAUTH_SCOPES,
+        [],
+        [],
+        { accountId: "acc2", instance: "gsv-personal", version: "latest", components: ["gateway", "ripgit"] },
+      ),
+      width: "wide",
+    });
+  }
+  const now = Date.now();
+  if (kind === "success") {
+    const successJob: DeployJob = {
+      id: "job_preview_ok",
+      sessionId: "preview",
+      status: "succeeded",
+      createdAt: now,
+      updatedAt: now,
+      options: {
+        accountId: "acc1",
+        accountName: "My Cloudflare",
+        instance: "gsv",
+        version: "latest",
+        components: ["gateway", "ripgit", "assembler", "channel-discord"],
+      },
+      steps: [
+        { id: "authorize", title: "Authorize Cloudflare", description: "Confirm access.", status: "complete", detail: "Authorized My Cloudflare." },
+        { id: "release", title: "Choose GSV release", description: "Find the release.", status: "complete" },
+        { id: "prepare", title: "Prepare components", description: "Download and verify.", status: "complete" },
+        { id: "storage", title: "Create storage", description: "Set up storage resources.", status: "complete" },
+        { id: "workers", title: "Deploy Workers", description: "Upload Workers.", status: "complete" },
+        { id: "bindings", title: "Connect services", description: "Wire Workers together.", status: "complete" },
+        { id: "adapters", title: "Configure channels", description: "Apply channel settings.", status: "complete" },
+        { id: "finish", title: "Finish setup", description: "Confirm result.", status: "complete" },
+      ],
+      logs: [
+        { at: now, level: "info", message: "Queued deployment." },
+        { at: now, level: "info", message: "Deployment complete." },
+      ],
+      result: { version: "latest", gatewayUrl: "https://gsv.example.workers.dev" },
+    };
+    return page(c, { title: "Deploy gsv", body: jobPage(successJob), width: "wide" });
+  }
+  const error = kind === "selffix" ? "latest stable release not found" : "kv namespace could not be created";
+  const job: DeployJob = {
+    id: "job_preview_abc123",
+    sessionId: "preview",
+    status: "failed",
+    createdAt: now,
+    updatedAt: now,
+    options: {
+      accountId: "acc1",
+      accountName: "My Cloudflare",
+      instance: "gsv",
+      version: "latest",
+      components: ["gateway", "ripgit", "assembler", "channel-discord"],
+    },
+    steps: [
+      { id: "authorize", title: "Authorize Cloudflare", description: "Confirm access.", status: "complete", detail: "Authorized My Cloudflare." },
+      { id: "release", title: "Choose GSV release", description: "Find the release.", status: "complete" },
+      { id: "prepare", title: "Prepare components", description: "Download and verify.", status: "complete" },
+      { id: "storage", title: "Create storage", description: "Set up storage resources.", status: "failed" },
+      { id: "workers", title: "Deploy Workers", description: "Upload Workers.", status: "pending" },
+      { id: "finish", title: "Finish setup", description: "Confirm result.", status: "pending" },
+    ],
+    logs: [
+      { at: now, level: "info", message: "Queued deployment." },
+      { at: now, level: "info", message: "Prepared components." },
+      { at: now, level: "error", message: error },
+    ],
+    error,
+  };
+  return page(c, { title: "Deploy gsv", body: jobPage(job), width: "wide" });
+});
+
 app.get("/privacy", (c) =>
   page(c, {
     title: "Privacy",
@@ -284,6 +494,24 @@ function stringField(form: FormData, name: string): string {
 function optionalStringField(form: FormData, name: string): string | undefined {
   const value = stringField(form, name);
   return value || undefined;
+}
+
+function parseDeployPrefill(query: Record<string, string>): DeployPrefill | undefined {
+  const mode = query.update === "1" ? "update" : query.retry === "1" ? "retry" : undefined;
+  if (!mode) return undefined;
+  const components = query.components
+    ? query.components
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => ALL_COMPONENTS.includes(value as (typeof ALL_COMPONENTS)[number]))
+    : undefined;
+  return {
+    mode,
+    accountId: query.accountId || undefined,
+    instance: query.instance || undefined,
+    version: query.version || undefined,
+    components: components && components.length > 0 ? components : undefined,
+  };
 }
 
 function parseExistingTarget(value: string): { accountId: string; instance: string } | null {
