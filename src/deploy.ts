@@ -4,6 +4,7 @@ import { parse as parseJsonc } from "jsonc-parser";
 import { ungzip } from "pako";
 import { parse as parseToml } from "smol-toml";
 
+import { getDeployHelp } from "./deploy-help";
 import { deleteDeployCredentials, DeployJobWriter, getDeployCredentials } from "./jobs";
 import { trackEvent } from "./metrics";
 import type {
@@ -317,6 +318,88 @@ export async function findExistingGsvInstallations(
     const account = a.accountName.localeCompare(b.accountName);
     return account || a.instance.localeCompare(b.instance);
   });
+}
+
+export type DeleteInstallationResult = {
+  deleted: string[];
+  failed: Array<{ script: string; error: string }>;
+  storage?: { name: string; deleted: boolean; error?: string };
+};
+
+export type DeleteInstallationOptions = {
+  /** When true, also delete the install's R2 storage bucket and its data. */
+  deleteStorage?: boolean;
+};
+
+export function storageBucketNameForInstance(instance: string): string {
+  return instance === DEFAULT_DEPLOY_INSTANCE ? DEFAULT_STORAGE_BUCKET_NAME : `${instance}-storage`;
+}
+
+/**
+ * Removes the Worker scripts that make up a detected GSV install. Scripts are
+ * deleted with force=true so service bindings and Durable Object namespaces
+ * between components don't block removal.
+ *
+ * By default the R2 storage bucket and its data are left untouched so the
+ * install can be redeployed later without losing files. Pass `deleteStorage` to
+ * also delete the bucket (which permanently erases its contents).
+ */
+export async function deleteGsvInstallation(
+  accessToken: string,
+  installation: ExistingGsvInstallation,
+  options: DeleteInstallationOptions = {},
+): Promise<DeleteInstallationResult> {
+  const deleted: string[] = [];
+  const failed: Array<{ script: string; error: string }> = [];
+  // Delete the gateway (and other dependents) before their dependencies.
+  const ordered = [...installation.scriptNames].sort((a, b) => deleteOrder(b) - deleteOrder(a));
+  for (const scriptName of ordered) {
+    try {
+      await deleteWorkerScript(accessToken, installation.accountId, scriptName);
+      deleted.push(scriptName);
+    } catch (error) {
+      failed.push({ script: scriptName, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  const result: DeleteInstallationResult = { deleted, failed };
+  if (options.deleteStorage) {
+    const bucketName = storageBucketNameForInstance(installation.instance);
+    try {
+      await deleteR2Bucket(accessToken, installation.accountId, bucketName);
+      result.storage = { name: bucketName, deleted: true };
+    } catch (error) {
+      result.storage = { name: bucketName, deleted: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return result;
+}
+
+async function deleteR2Bucket(accessToken: string, accountId: string, bucketName: string): Promise<void> {
+  const response = await cloudflareRaw(
+    accessToken,
+    `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}`,
+    { method: "DELETE" },
+  );
+  // A bucket that is already gone is a success from the caller's perspective.
+  if (response.status === 404) return;
+  await parseCloudflareEnvelope(response, `Delete R2 bucket ${bucketName}`);
+}
+
+async function deleteWorkerScript(accessToken: string, accountId: string, scriptName: string): Promise<void> {
+  const response = await cloudflareRaw(
+    accessToken,
+    `/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}?force=true`,
+    { method: "DELETE" },
+  );
+  // A script that is already gone is a success from the caller's perspective.
+  if (response.status === 404) return;
+  await parseCloudflareEnvelope(response, `Delete script ${scriptName}`);
+}
+
+function deleteOrder(scriptName: string): number {
+  const match = componentForScriptName(scriptName);
+  return match ? deployOrder(match.component) : 100;
 }
 
 export async function runDeployWorkflow(
@@ -788,38 +871,7 @@ function formatCount(count: number, noun: string): string {
 }
 
 function friendlyErrorDetail(message: string): string {
-  const lower = message.toLowerCase();
-  if (lower.includes("credentials expired") || lower.includes("authorize cloudflare")) {
-    return "Your Cloudflare authorization expired. Start a new deployment and authorize Cloudflare again.";
-  }
-  if (lower.includes("instance name")) {
-    return "The GSV instance name is not valid. Use lowercase letters, numbers, and dashes only.";
-  }
-  if (lower.includes("no components selected") || lower.includes("unknown component")) {
-    return "Choose at least one valid GSV component and try the deployment again.";
-  }
-  if (lower.includes("invalid account") || lower.includes("authentication") || lower.includes("unauthorized")) {
-    return "Cloudflare did not accept this authorization. Log in again and approve the requested account access.";
-  }
-  if (lower.includes("forbidden") || lower.includes("permission") || lower.includes("scope")) {
-    return "Cloudflare rejected a deployment request. Reauthorize with the required scopes or check account permissions.";
-  }
-  if (lower.includes("latest stable release") || lower.includes("no dev") || lower.includes("release")) {
-    return "The selected GSV release is not available. Try the stable channel, the dev channel, or a specific release tag.";
-  }
-  if (lower.includes("checksum")) {
-    return "The downloaded release bundle did not match its checksum. Retry the deployment or choose another release.";
-  }
-  if (lower.includes("r2 bucket") || lower.includes("storage/kv") || lower.includes("kv namespace")) {
-    return "Cloudflare could not prepare storage for this GSV. Check that the account has access to the required Workers storage products.";
-  }
-  if (lower.includes("workers/scripts") || lower.includes("upload script") || lower.includes("workers.dev")) {
-    return "Cloudflare could not deploy or expose one of the Workers. Check Workers permissions and account limits.";
-  }
-  if (lower.includes("requires ripgit") || lower.includes("requires assembler")) {
-    return "The gateway depends on ripgit and assembler. Select those components or deploy them first.";
-  }
-  return "Deployment stopped before this step finished. The diagnostics below include the exact service response.";
+  return getDeployHelp(message).detail;
 }
 
 function deployOrder(component: string): number {
