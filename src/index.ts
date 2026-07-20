@@ -341,8 +341,16 @@ app.get("/metrics", async (c) => {
 
 app.get("/health", (c) => c.json({ ok: true }));
 
-// TEMP PREVIEW ROUTE — remove after review.
+// Auth-free page previews for local review. Enabled only when ENVIRONMENT is
+// "development" (set by the `dev` npm script); returns 404 in production.
 app.get("/preview/:kind", (c) => {
+  if (c.env.ENVIRONMENT !== "development") {
+    return page(c, {
+      title: "Not Found",
+      body: errorPage("Not Found", "That route does not exist."),
+      status: 404,
+    });
+  }
   const kind = c.req.param("kind");
   const previewInstalls = [
     { accountId: "acc1", accountName: "My Cloudflare", instance: "gsv", components: ["gateway", "ripgit", "assembler"], scriptNames: [] },
