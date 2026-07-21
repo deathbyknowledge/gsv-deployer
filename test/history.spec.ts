@@ -150,5 +150,20 @@ describe("fetchInstallList", () => {
 
     expect(installs).toHaveLength(1);
     expect(installs[0].account).toBe("Real Co");
+    expect(installs[0].internal).toBe(false);
+  });
+
+  it("includes internal and blank-account rows (flagged) when asked", async () => {
+    await insertDeployRelease(isoDay(0), "", "", "latest"); // unattributable
+    await insertDeployRelease(isoDay(1), INTERNAL_ACCOUNT, "gsv", "latest"); // internal by id/label
+    await insertDeployRelease(isoDay(2), "Real Co", "gsv", "latest");
+
+    const publicOnly = await fetchInstallList(bindings, false);
+    expect(publicOnly).toHaveLength(1);
+
+    const all = await fetchInstallList(bindings, true);
+    expect(all).toHaveLength(3);
+    expect(all.filter((row) => row.internal)).toHaveLength(2);
+    expect(all.find((row) => row.account === "Real Co")!.internal).toBe(false);
   });
 });
