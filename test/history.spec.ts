@@ -53,6 +53,7 @@ describe("fetchDeployTotals", () => {
 
     const totals = await fetchDeployTotals(bindings);
 
+    expect(totals.accountsAllTime).toBe(2); // acc-public-1, acc-public-2
     expect(totals.installsAllTime).toBe(2);
     expect(totals.installs30d).toBe(2);
     expect(totals.installs7d).toBe(2);
@@ -60,6 +61,19 @@ describe("fetchDeployTotals", () => {
     expect(totals.deploys30d).toBe(3); // 40-day-old deploy falls outside the window
     expect(totals.deploys7d).toBe(3);
     expect(totals.failuresAllTime).toBe(0); // only the internal row had a failure
+  });
+
+  it("counts one account with several installs as one account but many installs", async () => {
+    const today = isoDay(0);
+    await insertDeploy(today, "acc-multi", "", "gsv", 1, 0);
+    await insertDeploy(today, "acc-multi", "", "gsv-work", 1, 0);
+    await insertDeploy(today, "acc-multi", "", "gsv-personal", 3, 0); // redeploys don't inflate installs
+
+    const totals = await fetchDeployTotals(bindings);
+
+    expect(totals.accountsAllTime).toBe(1);
+    expect(totals.installsAllTime).toBe(3);
+    expect(totals.deploysAllTime).toBe(5); // 1 + 1 + 3
   });
 
   it("does not count installs that only ever failed", async () => {

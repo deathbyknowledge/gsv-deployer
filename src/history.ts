@@ -126,6 +126,9 @@ export async function rollupHistory(env: AppEnv["Bindings"], days: number): Prom
 }
 
 export type DeployTotals = {
+  accountsAllTime: number;
+  accounts30d: number;
+  accounts7d: number;
   installsAllTime: number;
   installs30d: number;
   installs7d: number;
@@ -145,11 +148,14 @@ type DeployHistoryRow = {
   failures: number;
 };
 
-// A GSV "install" is a distinct (account, instance). Old rows may lack account_id,
-// so fall back to the human-readable label to key them.
+// Old rows may lack account_id, so fall back to the human-readable label to key
+// an account. An "install" is one such account paired with an install name.
+function accountKey(row: DeployHistoryRow): string {
+  return row.account_id || row.account_label;
+}
+
 function installKey(row: DeployHistoryRow): string {
-  const account = row.account_id || row.account_label;
-  return `${account}::${row.instance}`;
+  return `${accountKey(row)}::${row.instance}`;
 }
 
 export async function fetchDeployTotals(env: AppEnv["Bindings"]): Promise<DeployTotals> {
@@ -167,6 +173,9 @@ export async function fetchDeployTotals(env: AppEnv["Bindings"]): Promise<Deploy
   const cut30 = cutoff(30);
   const cut7 = cutoff(7);
 
+  const accountsAll = new Set<string>();
+  const accounts30 = new Set<string>();
+  const accounts7 = new Set<string>();
   const installsAll = new Set<string>();
   const installs30 = new Set<string>();
   const installs7 = new Set<string>();
@@ -185,14 +194,25 @@ export async function fetchDeployTotals(env: AppEnv["Bindings"]): Promise<Deploy
     if (row.day >= cut7) deploys7d += successes;
     if (firstDay === null || row.day < firstDay) firstDay = row.day;
     if (successes > 0) {
-      const key = installKey(row);
-      installsAll.add(key);
-      if (row.day >= cut30) installs30.add(key);
-      if (row.day >= cut7) installs7.add(key);
+      const account = accountKey(row);
+      const install = installKey(row);
+      accountsAll.add(account);
+      installsAll.add(install);
+      if (row.day >= cut30) {
+        accounts30.add(account);
+        installs30.add(install);
+      }
+      if (row.day >= cut7) {
+        accounts7.add(account);
+        installs7.add(install);
+      }
     }
   }
 
   return {
+    accountsAllTime: accountsAll.size,
+    accounts30d: accounts30.size,
+    accounts7d: accounts7.size,
     installsAllTime: installsAll.size,
     installs30d: installs30.size,
     installs7d: installs7.size,
