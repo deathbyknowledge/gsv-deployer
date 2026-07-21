@@ -238,12 +238,18 @@ export type InstallRow = {
   firstDay: string;
   lastDay: string;
   deploys: number;
+  internal: boolean;
 };
 
 // One entry per distinct install (account + instance), newest activity first.
 // `release` is whatever was deployed on the most recent day, so an install that
-// was updated shows its current release, not its original one.
-export async function fetchInstallList(env: AppEnv["Bindings"]): Promise<InstallRow[]> {
+// was updated shows its current release, not its original one. By default the
+// internal account and unattributable deploys are hidden; pass includeInternal to
+// show them too (flagged with `internal: true`).
+export async function fetchInstallList(
+  env: AppEnv["Bindings"],
+  includeInternal = false,
+): Promise<InstallRow[]> {
   await ensureSchema(env);
   const internal = internalAccountIds(env);
   const { results } = await env.METRICS_DB.prepare(
@@ -252,12 +258,12 @@ export async function fetchInstallList(env: AppEnv["Bindings"]): Promise<Install
      ORDER BY day ASC`,
   ).all<DeployHistoryRow & { release: string }>();
 
-  const rows = (results ?? []).filter((row) => isPublicDeploy(row, internal));
-
   const installs = new Map<string, InstallRow>();
-  for (const row of rows) {
+  for (const row of results ?? []) {
     const successes = Number(row.successes) || 0;
     if (successes <= 0) continue; // only surface installs that actually deployed
+    const isPublic = isPublicDeploy(row, internal);
+    if (!isPublic && !includeInternal) continue;
     const key = installKey(row);
     const account = row.account_label || row.account_id;
     const existing = installs.get(key);
@@ -269,6 +275,7 @@ export async function fetchInstallList(env: AppEnv["Bindings"]): Promise<Install
         firstDay: row.day,
         lastDay: row.day,
         deploys: successes,
+        internal: !isPublic,
       });
       continue;
     }

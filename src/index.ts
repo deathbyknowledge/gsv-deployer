@@ -232,6 +232,11 @@ app.get("/metrics", async (c) => {
   if (denied) return denied;
 
   try {
+    // ?installs=all shows the internal account too; ?installs=public forces the
+    // default filtered view. Either param keeps the (otherwise collapsed) list open.
+    const installsParam = c.req.query("installs");
+    const installsIncludeInternal = installsParam === "all";
+    const installsExpanded = installsParam === "all" || installsParam === "public";
     const [summary, aeDaily, byCountry, byHour, recentDeploys, deployTotals, installs, history] = await Promise.all([
       fetchMetricsSummary(c.env),
       fetchMetricsDaily(c.env),
@@ -239,7 +244,7 @@ app.get("/metrics", async (c) => {
       fetchMetricsByHour(c.env),
       fetchRecentDeploys(c.env),
       fetchDeployTotals(c.env),
-      fetchInstallList(c.env),
+      fetchInstallList(c.env, installsIncludeInternal),
       fetchDailyHistory(c.env, 90),
     ]);
     // Durable rollups give the full funnel history; fall back to the 14-day AE
@@ -248,7 +253,18 @@ app.get("/metrics", async (c) => {
     const daily = dailyFromHistory ? history : aeDaily;
     return page(c, {
       title: "Metrics",
-      body: metricsPage(deployTotals, installs, summary, daily, dailyFromHistory, byCountry, byHour, recentDeploys),
+      body: metricsPage(
+        deployTotals,
+        installs,
+        installsIncludeInternal,
+        installsExpanded,
+        summary,
+        daily,
+        dailyFromHistory,
+        byCountry,
+        byHour,
+        recentDeploys,
+      ),
       width: "wide",
     });
   } catch (error) {

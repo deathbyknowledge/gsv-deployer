@@ -797,6 +797,37 @@ textarea:focus {
   margin-top: 0.95rem;
 }
 
+.install-toggle {
+  display: inline-flex;
+  margin: 0.85rem 0 0.25rem;
+}
+
+.install-toggle a {
+  border: 1px solid var(--line-strong);
+  color: var(--accent);
+  font-size: 0.78rem;
+  padding: 0.3rem 0.7rem;
+  text-decoration: none;
+}
+
+.install-toggle a + a { border-left: 0; }
+.install-toggle a:first-child { border-radius: 2px 0 0 2px; }
+.install-toggle a:last-child { border-radius: 0 2px 2px 0; }
+
+.install-toggle a.active {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+.install-tag {
+  background: var(--accent-soft);
+  border-radius: 2px;
+  color: var(--accent);
+  font-size: 0.68rem;
+  padding: 0.05rem 0.35rem;
+  text-transform: uppercase;
+}
+
 .diagnostics summary {
   cursor: pointer;
   font-weight: 700;

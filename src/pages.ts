@@ -167,6 +167,8 @@ export function errorPage(title: string, message: string): string {
 export function metricsPage(
   deployTotals: DeployTotals,
   installs: InstallRow[],
+  installsIncludeInternal: boolean,
+  installsExpanded: boolean,
   summary: MetricsSummaryRow[],
   daily: MetricsDailyRow[],
   dailyFromHistory: boolean,
@@ -178,8 +180,8 @@ export function metricsPage(
   const installListRows = installs
     .map(
       (row) => `<tr>
-  <td>${escapeHtml(row.instance)}</td>
-  <td>${escapeHtml(row.account)}</td>
+  <td>${escapeHtml(row.instance || "—")}</td>
+  <td>${escapeHtml(row.account || "(unattributed)")}${row.internal ? ` <span class="install-tag">ours</span>` : ""}</td>
   <td>${escapeHtml(row.release)}</td>
   <td>${escapeHtml(row.firstDay)}</td>
   <td>${escapeHtml(row.lastDay)}</td>
@@ -187,6 +189,10 @@ export function metricsPage(
 </tr>`,
     )
     .join("");
+  const installToggle = `<div class="install-toggle" role="group" aria-label="Install list filter">
+  <a href="/metrics?installs=public"${installsIncludeInternal ? "" : ` class="active" aria-current="true"`}>Public only</a>
+  <a href="/metrics?installs=all"${installsIncludeInternal ? ` class="active" aria-current="true"` : ""}>Include ours</a>
+</div>`;
   const dailyRange = dailyFromHistory
     ? `Full history from durable rollups${deployTotals.firstDay ? ` (since ${escapeHtml(deployTotals.firstDay)})` : ""}.`
     : "Last 14 days from Analytics Engine. Longer history appears once the nightly rollup has run.";
@@ -254,8 +260,9 @@ export function metricsPage(
 <p class="hint stat-note">Excludes the humans &amp; machines internal account. <strong>Accounts</strong> = distinct Cloudflare accounts; <strong>installs</strong> = distinct account + install name (someone running two named GSVs in one account counts as two). Both ignore redeploys/updates. <strong>Successful deploys</strong> is the only figure that counts every (re)deploy.</p>
 <section class="section">
   <h2>All installs</h2>
-  <details class="install-list">
-    <summary>${installs.length} install${installs.length === 1 ? "" : "s"} &mdash; account, name, release, dates</summary>
+  <details class="install-list"${installsExpanded ? " open" : ""}>
+    <summary>${installs.length} install${installs.length === 1 ? "" : "s"}${installsIncludeInternal ? " (incl. ours)" : ""} &mdash; account, name, release, dates</summary>
+    ${installToggle}
     <table class="metrics-table">
       <thead><tr><th>Install</th><th>Account</th><th>Latest release</th><th>First deployed</th><th>Last deployed</th><th class="num">Deploys</th></tr></thead>
       <tbody>${installListRows || `<tr><td colspan="6">No installs recorded yet.</td></tr>`}</tbody>
