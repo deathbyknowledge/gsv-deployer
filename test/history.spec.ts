@@ -153,6 +153,19 @@ describe("fetchInstallList", () => {
     expect(installs[0].internal).toBe(false);
   });
 
+  it("excludes the internal account matched by its display name", async () => {
+    // Old internal deploys stored the account name, not the id, in the label.
+    await insertDeployRelease(isoDay(0), "Humans and Machines", "gsv", "latest");
+    await insertDeployRelease(isoDay(0), "Real Co", "gsv", "latest");
+
+    const publicOnly = await fetchInstallList(bindings, false);
+    expect(publicOnly).toHaveLength(1);
+    expect(publicOnly[0].account).toBe("Real Co");
+
+    const all = await fetchInstallList(bindings, true);
+    expect(all.find((row) => row.account === "Humans and Machines")!.internal).toBe(true);
+  });
+
   it("includes internal and blank-account rows (flagged) when asked", async () => {
     await insertDeployRelease(isoDay(0), "", "", "latest"); // unattributable
     await insertDeployRelease(isoDay(1), INTERNAL_ACCOUNT, "gsv", "latest"); // internal by id/label
