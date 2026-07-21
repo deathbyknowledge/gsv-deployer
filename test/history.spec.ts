@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { fetchDeployTotals } from "../src/history";
+import { fetchDeployTotals, fetchInstallList } from "../src/history";
 import type { AppEnv } from "../src/types";
 
 const bindings = env as unknown as AppEnv["Bindings"];
@@ -85,5 +85,45 @@ describe("fetchDeployTotals", () => {
     expect(totals.installsAllTime).toBe(0);
     expect(totals.deploysAllTime).toBe(0);
     expect(totals.failuresAllTime).toBe(3);
+  });
+});
+
+async function insertDeployRelease(day: string, accountLabel: string, instance: string, release: string): Promise<void> {
+  await bindings.METRICS_DB.prepare(
+    `INSERT OR REPLACE INTO daily_deploys (day, account_id, account_label, instance, release, successes, failures)
+     VALUES (?, '', ?, ?, ?, 1, 0)`,
+  )
+    .bind(day, accountLabel, instance, release)
+    .run();
+}
+
+describe("fetchInstallList", () => {
+  beforeEach(async () => {
+    await fetchInstallList(bindings);
+    await bindings.METRICS_DB.prepare(`DELETE FROM daily_deploys`).run();
+  });
+
+  it("lists one row per install with its latest release and date range", async () => {
+    // Same install updated across three days with a newer release each time.
+    await insertDeployRelease(isoDay(10), "Acme", "gsv", "v0.8.0");
+    await insertDeployRelease(isoDay(5), "Acme", "gsv", "v0.9.0");
+    await insertDeployRelease(isoDay(1), "Acme", "gsv", "latest");
+    // A second, separate install with more recent activity.
+    await insertDeployRelease(isoDay(0), "Beta Co", "gsv-work", "latest");
+    // Internal account — excluded from the list.
+    await insertDeployRelease(isoDay(0), INTERNAL_ACCOUNT, "gsv", "latest");
+
+    const installs = await fetchInstallList(bindings);
+
+    expect(installs).toHaveLength(2);
+    // Sorted by most recent activity first.
+    expect(installs[0]).toMatchObject({ account: "Beta Co", instance: "gsv-work" });
+
+    const acme = installs.find((row) => row.account === "Acme");
+    expect(acme).toBeDefined();
+    expect(acme!.release).toBe("latest"); // release from the most recent deploy
+    expect(acme!.firstDay).toBe(isoDay(10));
+    expect(acme!.lastDay).toBe(isoDay(1));
+    expect(acme!.deploys).toBe(3);
   });
 });

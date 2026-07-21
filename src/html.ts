@@ -787,6 +787,16 @@ textarea:focus {
   margin-top: 0.85rem;
 }
 
+.install-list summary {
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.install-list table {
+  margin-top: 0.95rem;
+}
+
 .diagnostics summary {
   cursor: pointer;
   font-weight: 700;

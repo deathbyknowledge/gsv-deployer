@@ -224,6 +224,60 @@ export async function fetchDeployTotals(env: AppEnv["Bindings"]): Promise<Deploy
   };
 }
 
+export type InstallRow = {
+  account: string;
+  instance: string;
+  release: string;
+  firstDay: string;
+  lastDay: string;
+  deploys: number;
+};
+
+// One entry per distinct install (account + instance), newest activity first.
+// `release` is whatever was deployed on the most recent day, so an install that
+// was updated shows its current release, not its original one.
+export async function fetchInstallList(env: AppEnv["Bindings"]): Promise<InstallRow[]> {
+  await ensureSchema(env);
+  const internal = internalAccountIds(env);
+  const { results } = await env.METRICS_DB.prepare(
+    `SELECT day, account_id, account_label, instance, release, successes
+     FROM daily_deploys
+     ORDER BY day ASC`,
+  ).all<DeployHistoryRow & { release: string }>();
+
+  const rows = (results ?? []).filter(
+    (row) => !internal.has(row.account_id) && !internal.has(row.account_label),
+  );
+
+  const installs = new Map<string, InstallRow>();
+  for (const row of rows) {
+    const successes = Number(row.successes) || 0;
+    if (successes <= 0) continue; // only surface installs that actually deployed
+    const key = installKey(row);
+    const account = row.account_label || row.account_id;
+    const existing = installs.get(key);
+    if (!existing) {
+      installs.set(key, {
+        account,
+        instance: row.instance,
+        release: row.release,
+        firstDay: row.day,
+        lastDay: row.day,
+        deploys: successes,
+      });
+      continue;
+    }
+    existing.deploys += successes;
+    if (row.day < existing.firstDay) existing.firstDay = row.day;
+    // Rows are ascending by day, so a later row is always at-or-after lastDay;
+    // adopt its release as the current one.
+    existing.lastDay = row.day;
+    existing.release = row.release;
+  }
+
+  return [...installs.values()].sort((a, b) => (a.lastDay < b.lastDay ? 1 : a.lastDay > b.lastDay ? -1 : 0));
+}
+
 // Returns rolled-up funnel counts in the same shape as the AE daily query so the
 // existing pivot/render code can consume either source.
 export async function fetchDailyHistory(env: AppEnv["Bindings"], maxDays: number): Promise<MetricsDailyRow[]> {
