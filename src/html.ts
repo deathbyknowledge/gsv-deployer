@@ -744,6 +744,49 @@ textarea:focus {
   text-align: right;
 }
 
+.stat-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  margin-top: 1.5rem;
+}
+
+.stat-card {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 1rem 1.1rem;
+}
+
+.stat-value {
+  color: var(--text);
+  font-size: 1.9rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.stat-label {
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.stat-sub {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.stat-note {
+  margin-top: 0.85rem;
+}
+
 .diagnostics summary {
   cursor: pointer;
   font-weight: 700;

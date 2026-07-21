@@ -12,6 +12,9 @@ export type AppEnv = {
     GSV_REPO_OWNER?: string;
     GSV_REPO_NAME?: string;
     INTERNAL_IPS?: string;
+    // Comma-separated Cloudflare account IDs (or account labels) whose deploys are
+    // excluded from the "GSVs deployed" headline — e.g. the founders' own account.
+    INTERNAL_ACCOUNT_IDS?: string;
     METRICS_USER: string;
     METRICS_PASSWORD: string;
     OAUTH_SCOPES: string;
@@ -22,6 +25,9 @@ export type AppEnv = {
     DEPLOY_JOBS: DurableObjectNamespace<DeployJobState>;
     DEPLOY_WORKFLOW: Workflow<DeployWorkflowParams>;
     METRICS: AnalyticsEngineDataset;
+    // Durable daily rollups of Analytics Engine data so history survives past AE's
+    // ~90-day retention window. Populated by the nightly scheduled handler.
+    METRICS_DB: D1Database;
   };
 };
 

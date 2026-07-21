@@ -48,6 +48,18 @@
 			"dataset": "gsv_deploy_metrics"
 		}
 	],
+	"d1_databases": [
+		{
+			"binding": "METRICS_DB",
+			"database_name": "gsv-metrics",
+			"database_id": "dc675e0e-8946-4ea7-a196-149d749657e9"
+		}
+	],
+	"triggers": {
+		"crons": [
+			"10 0 * * *"
+		]
+	},
 	"workflows": [
 		{
 			"name": "gsv-deployment-workflow",
@@ -64,6 +76,7 @@
 		"GSV_REPO_OWNER": "deathbyknowledge",
 		"GSV_REPO_NAME": "gsv",
 		"GITHUB_REPO_URL": "https://github.com/deathbyknowledge/gsv",
+		"INTERNAL_ACCOUNT_IDS": "f7c938a773193df3a4ac230b24bc8259",
 		"OAUTH_SCOPES": "account-settings.read user-details.read memberships.read workers-scripts.read workers-scripts.write workers-r2.read workers-r2.write workers-kv-storage.read workers-kv-storage.write ai.write",
 		"OAUTH_TOKEN_AUTH_METHOD": "client_secret_post"
 	},

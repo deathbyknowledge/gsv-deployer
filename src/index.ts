@@ -29,6 +29,7 @@ import {
   requireMetricsAuth,
   trackRequestEvent,
 } from "./metrics";
+import { fetchDailyHistory, fetchDeployTotals, rollupHistory } from "./history";
 import type { AppEnv, DeployAdapterSecrets, DeployJob, DeployOptions } from "./types";
 
 const app = new Hono<AppEnv>();
@@ -153,6 +154,7 @@ app.post("/deploy", async (c) => {
     job.id,
     options.instance,
     options.accountName || options.accountId,
+    options.accountId,
   );
   try {
     const instance = await c.env.DEPLOY_WORKFLOW.create({
@@ -230,16 +232,22 @@ app.get("/metrics", async (c) => {
   if (denied) return denied;
 
   try {
-    const [summary, daily, byCountry, byHour, recentDeploys] = await Promise.all([
+    const [summary, aeDaily, byCountry, byHour, recentDeploys, deployTotals, history] = await Promise.all([
       fetchMetricsSummary(c.env),
       fetchMetricsDaily(c.env),
       fetchMetricsByCountry(c.env),
       fetchMetricsByHour(c.env),
       fetchRecentDeploys(c.env),
+      fetchDeployTotals(c.env),
+      fetchDailyHistory(c.env, 90),
     ]);
+    // Durable rollups give the full funnel history; fall back to the 14-day AE
+    // window until the first nightly rollup (or a backfill) has populated D1.
+    const dailyFromHistory = history.length > 0;
+    const daily = dailyFromHistory ? history : aeDaily;
     return page(c, {
       title: "Metrics",
-      body: metricsPage(summary, daily, byCountry, byHour, recentDeploys),
+      body: metricsPage(deployTotals, summary, daily, dailyFromHistory, byCountry, byHour, recentDeploys),
       width: "wide",
     });
   } catch (error) {
@@ -249,6 +257,21 @@ app.get("/metrics", async (c) => {
       body: errorPage("Metrics unavailable", message),
       status: 502,
     });
+  }
+});
+
+// One-time (or occasional) seed of the durable history tables from whatever
+// Analytics Engine still retains. Behind the same auth as /metrics. Idempotent —
+// safe to re-run. Example: curl -u user:pass -X POST '.../metrics/backfill?days=90'
+app.post("/metrics/backfill", async (c) => {
+  const denied = requireMetricsAuth(c);
+  if (denied) return denied;
+  const days = Number(c.req.query("days") ?? "90");
+  try {
+    const result = await rollupHistory(c.env, Number.isFinite(days) ? days : 90);
+    return c.json({ ok: true, ...result });
+  } catch (error) {
+    return c.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 502);
   }
 });
 
@@ -314,4 +337,21 @@ function redirectWithCookies(location: string, cookies: string[]): Response {
   return new Response(null, { status: 302, headers });
 }
 
-export default app;
+export default {
+  fetch: app.fetch,
+  // Nightly cron: fold the last few days of Analytics Engine data into the durable
+  // rollup tables. A trailing window (not just yesterday) absorbs late-arriving
+  // events and covers the occasional missed run. Idempotent via INSERT OR REPLACE.
+  scheduled(_event: ScheduledController, env: AppEnv["Bindings"], ctx: ExecutionContext): void {
+    ctx.waitUntil(
+      rollupHistory(env, 3).catch((error) => {
+        console.error(
+          JSON.stringify({
+            message: "Metrics history rollup failed",
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }),
+    );
+  },
+} satisfies ExportedHandler<AppEnv["Bindings"]>;

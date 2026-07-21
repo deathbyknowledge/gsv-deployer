@@ -1,0 +1,75 @@
+import { env } from "cloudflare:workers";
+import { beforeEach, describe, expect, it } from "vitest";
+
+import { fetchDeployTotals } from "../src/history";
+import type { AppEnv } from "../src/types";
+
+const bindings = env as unknown as AppEnv["Bindings"];
+
+// wrangler.jsonc pins INTERNAL_ACCOUNT_IDS to the founders' own account so its
+// deploys never inflate the public numbers.
+const INTERNAL_ACCOUNT = "f7c938a773193df3a4ac230b24bc8259";
+
+function isoDay(offsetDays: number): string {
+  return new Date(Date.now() - offsetDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+async function insertDeploy(
+  day: string,
+  accountId: string,
+  accountLabel: string,
+  instance: string,
+  successes: number,
+  failures: number,
+): Promise<void> {
+  await bindings.METRICS_DB.prepare(
+    `INSERT OR REPLACE INTO daily_deploys (day, account_id, account_label, instance, release, successes, failures)
+     VALUES (?, ?, ?, ?, 'latest', ?, ?)`,
+  )
+    .bind(day, accountId, accountLabel, instance, successes, failures)
+    .run();
+}
+
+describe("fetchDeployTotals", () => {
+  beforeEach(async () => {
+    // fetchDeployTotals creates the schema on first call; run it once so the table
+    // exists, then start each test from a clean slate.
+    await fetchDeployTotals(bindings);
+    await bindings.METRICS_DB.prepare(`DELETE FROM daily_deploys`).run();
+  });
+
+  it("counts distinct installs and excludes the internal account", async () => {
+    const today = isoDay(0);
+    const old = isoDay(40);
+
+    // Same install (account + instance) deployed twice today and once long ago:
+    // one install, three successful deploys.
+    await insertDeploy(today, "acc-public-1", "", "gsv", 2, 0);
+    await insertDeploy(old, "acc-public-1", "", "gsv", 1, 0);
+    // A different public install.
+    await insertDeploy(today, "acc-public-2", "", "gsv-work", 1, 0);
+    // Internal account — must be excluded entirely.
+    await insertDeploy(today, INTERNAL_ACCOUNT, "humans & machines", "gsv", 5, 1);
+
+    const totals = await fetchDeployTotals(bindings);
+
+    expect(totals.installsAllTime).toBe(2);
+    expect(totals.installs30d).toBe(2);
+    expect(totals.installs7d).toBe(2);
+    expect(totals.deploysAllTime).toBe(4); // 2 + 1 + 1, internal's 5 excluded
+    expect(totals.deploys30d).toBe(3); // 40-day-old deploy falls outside the window
+    expect(totals.deploys7d).toBe(3);
+    expect(totals.failuresAllTime).toBe(0); // only the internal row had a failure
+  });
+
+  it("does not count installs that only ever failed", async () => {
+    const today = isoDay(0);
+    await insertDeploy(today, "acc-fail-only", "", "gsv", 0, 3);
+
+    const totals = await fetchDeployTotals(bindings);
+
+    expect(totals.installsAllTime).toBe(0);
+    expect(totals.deploysAllTime).toBe(0);
+    expect(totals.failuresAllTime).toBe(3);
+  });
+});

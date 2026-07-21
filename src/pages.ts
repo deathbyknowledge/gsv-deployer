@@ -3,6 +3,7 @@ import { ALL_COMPONENTS } from "./deploy";
 import type { ExistingGsvInstallation, ReleaseOption } from "./deploy";
 import { cloudflareMark, discordIcon, escapeHtml, octocatIcon, xIcon } from "./html";
 import type { MetricsCountryRow, MetricsDailyRow, MetricsHourRow, MetricsRecentDeployRow, MetricsSummaryRow } from "./metrics";
+import type { DeployTotals } from "./history";
 
 export function homePage(repoUrl: string): string {
   return `<section class="home-sheet">
@@ -164,12 +165,18 @@ export function errorPage(title: string, message: string): string {
 }
 
 export function metricsPage(
+  deployTotals: DeployTotals,
   summary: MetricsSummaryRow[],
   daily: MetricsDailyRow[],
+  dailyFromHistory: boolean,
   byCountry: MetricsCountryRow[],
   byHour: MetricsHourRow[],
   recentDeploys: MetricsRecentDeployRow[],
 ): string {
+  const statCards = deployStatCards(deployTotals);
+  const dailyRange = dailyFromHistory
+    ? `Full history from durable rollups${deployTotals.firstDay ? ` (since ${escapeHtml(deployTotals.firstDay)})` : ""}.`
+    : "Last 14 days from Analytics Engine. Longer history appears once the nightly rollup has run.";
   const recentDeployRows = recentDeploys
     .map(
       (row) => `<tr>
@@ -228,8 +235,10 @@ export function metricsPage(
     .join("");
 
   return `<p class="eyebrow">Metrics</p>
-<h1 class="page-title">Login &amp; deploy funnel</h1>
-<p class="prose">Server-recorded events from Workers Analytics Engine. Counts are approximate and can take a few minutes to appear after each event.</p>
+<h1 class="page-title">GSV deploys &amp; funnel</h1>
+<p class="prose">Server-recorded events from Workers Analytics Engine, with long-term history preserved in durable daily rollups. Counts are approximate and can take a few minutes to appear after each event.</p>
+<section class="stat-grid" aria-label="GSVs deployed">${statCards}</section>
+<p class="hint stat-note">Deploy counts exclude the humans &amp; machines internal account. A GSV is one distinct account + install name; deploys count every successful (re)deploy.</p>
 <section class="section">
   <h2>Recent deploys</h2>
   <table class="metrics-table">
@@ -245,14 +254,15 @@ export function metricsPage(
   </table>
 </section>
 <section class="section">
-  <h2>Daily, last 14 days</h2>
+  <h2>Daily funnel</h2>
+  <p class="prose">${dailyRange}</p>
   <table class="metrics-table">
     <thead><tr><th>Day</th><th class="num">Login button clicks</th><th class="num">Login via expired session</th><th class="num">Deploy page views</th><th class="num">Click &rarr; deploy</th><th class="num">Deploy submitted</th><th class="num">Deploy succeeded</th><th class="num">Submit &rarr; success</th></tr></thead>
     <tbody>${dailyRows || `<tr><td colspan="8">No events recorded yet.</td></tr>`}</tbody>
   </table>
 </section>
 <section class="section">
-  <h2>By country, last 30 days</h2>
+  <h2>By country, last 90 days</h2>
   <p class="prose">Country-level only, from Cloudflare's edge geolocation. No IP addresses or finer location data are stored.</p>
   <table class="metrics-table">
     <thead><tr><th>Country</th><th class="num">Events</th></tr></thead>
@@ -260,12 +270,30 @@ export function metricsPage(
   </table>
 </section>
 <section class="section">
-  <h2>By hour of day, last 30 days</h2>
+  <h2>By hour of day, last 90 days</h2>
   <table class="metrics-table">
     <thead><tr><th>Hour</th><th class="num">Events</th></tr></thead>
     <tbody>${hourRows}</tbody>
   </table>
 </section>`;
+}
+
+function deployStatCards(totals: DeployTotals): string {
+  const cards: Array<{ label: string; value: number; sub: string }> = [
+    { label: "GSVs deployed", value: totals.installsAllTime, sub: "distinct installs, all time" },
+    { label: "New in 30 days", value: totals.installs30d, sub: "distinct installs" },
+    { label: "New in 7 days", value: totals.installs7d, sub: "distinct installs" },
+    { label: "Successful deploys", value: totals.deploysAllTime, sub: "all time, incl. updates" },
+  ];
+  return cards
+    .map(
+      (card) => `<div class="stat-card">
+  <span class="stat-value">${card.value.toLocaleString("en-US")}</span>
+  <span class="stat-label">${escapeHtml(card.label)}</span>
+  <span class="stat-sub">${escapeHtml(card.sub)}</span>
+</div>`,
+    )
+    .join("");
 }
 
 function formatMetricsTimestamp(value: string): string {
