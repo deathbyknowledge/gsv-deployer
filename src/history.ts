@@ -151,11 +151,20 @@ type DeployHistoryRow = {
 // Old rows may lack account_id, so fall back to the human-readable label to key
 // an account. An "install" is one such account paired with an install name.
 function accountKey(row: DeployHistoryRow): string {
-  return row.account_id || row.account_label;
+  return (row.account_id || row.account_label || "").trim();
 }
 
 function installKey(row: DeployHistoryRow): string {
   return `${accountKey(row)}::${row.instance}`;
+}
+
+// A deploy row counts toward public metrics only if we can attribute it to a real,
+// non-internal account. Deploys recorded before the account id/name were tracked
+// have a blank account and can't be attributed — including internal test deploys —
+// so they're dropped. Internal accounts are matched by id or label.
+function isPublicDeploy(row: DeployHistoryRow, internal: Set<string>): boolean {
+  if (!accountKey(row)) return false;
+  return !internal.has(row.account_id) && !internal.has(row.account_label);
 }
 
 export async function fetchDeployTotals(env: AppEnv["Bindings"]): Promise<DeployTotals> {
@@ -165,9 +174,7 @@ export async function fetchDeployTotals(env: AppEnv["Bindings"]): Promise<Deploy
     `SELECT day, account_id, account_label, instance, successes, failures FROM daily_deploys`,
   ).all<DeployHistoryRow>();
 
-  const rows = (results ?? []).filter(
-    (row) => !internal.has(row.account_id) && !internal.has(row.account_label),
-  );
+  const rows = (results ?? []).filter((row) => isPublicDeploy(row, internal));
 
   const cutoff = (days: number): string => isoDay(daysAgo(days));
   const cut30 = cutoff(30);
@@ -245,9 +252,7 @@ export async function fetchInstallList(env: AppEnv["Bindings"]): Promise<Install
      ORDER BY day ASC`,
   ).all<DeployHistoryRow & { release: string }>();
 
-  const rows = (results ?? []).filter(
-    (row) => !internal.has(row.account_id) && !internal.has(row.account_label),
-  );
+  const rows = (results ?? []).filter((row) => isPublicDeploy(row, internal));
 
   const installs = new Map<string, InstallRow>();
   for (const row of rows) {

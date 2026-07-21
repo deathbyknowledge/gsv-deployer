@@ -86,6 +86,21 @@ describe("fetchDeployTotals", () => {
     expect(totals.deploysAllTime).toBe(0);
     expect(totals.failuresAllTime).toBe(3);
   });
+
+  it("drops pre-instrumentation deploys with no attributable account", async () => {
+    const today = isoDay(0);
+    // Both account id and label blank — e.g. internal test deploys made before the
+    // account was recorded. Cannot be attributed, so must not appear in any total.
+    await insertDeploy(today, "", "", "", 4, 1);
+    await insertDeploy(today, "acc-real", "", "gsv", 2, 0);
+
+    const totals = await fetchDeployTotals(bindings);
+
+    expect(totals.accountsAllTime).toBe(1);
+    expect(totals.installsAllTime).toBe(1);
+    expect(totals.deploysAllTime).toBe(2); // the blank-account 4 is excluded
+    expect(totals.failuresAllTime).toBe(0);
+  });
 });
 
 async function insertDeployRelease(day: string, accountLabel: string, instance: string, release: string): Promise<void> {
@@ -125,5 +140,15 @@ describe("fetchInstallList", () => {
     expect(acme!.firstDay).toBe(isoDay(10));
     expect(acme!.lastDay).toBe(isoDay(1));
     expect(acme!.deploys).toBe(3);
+  });
+
+  it("omits blank-account rows from the list", async () => {
+    await insertDeployRelease(isoDay(0), "", "", "latest"); // no account, no instance
+    await insertDeployRelease(isoDay(0), "Real Co", "gsv", "latest");
+
+    const installs = await fetchInstallList(bindings);
+
+    expect(installs).toHaveLength(1);
+    expect(installs[0].account).toBe("Real Co");
   });
 });
