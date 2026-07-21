@@ -3,7 +3,7 @@ import { ALL_COMPONENTS } from "./deploy";
 import type { ExistingGsvInstallation, ReleaseOption } from "./deploy";
 import { cloudflareMark, discordIcon, escapeHtml, octocatIcon, xIcon } from "./html";
 import type { MetricsCountryRow, MetricsDailyRow, MetricsHourRow, MetricsRecentDeployRow, MetricsSummaryRow } from "./metrics";
-import type { DeployTotals } from "./history";
+import type { DeployTotals, InstallRow } from "./history";
 
 export function homePage(repoUrl: string): string {
   return `<section class="home-sheet">
@@ -166,6 +166,7 @@ export function errorPage(title: string, message: string): string {
 
 export function metricsPage(
   deployTotals: DeployTotals,
+  installs: InstallRow[],
   summary: MetricsSummaryRow[],
   daily: MetricsDailyRow[],
   dailyFromHistory: boolean,
@@ -174,6 +175,18 @@ export function metricsPage(
   recentDeploys: MetricsRecentDeployRow[],
 ): string {
   const statCards = deployStatCards(deployTotals);
+  const installListRows = installs
+    .map(
+      (row) => `<tr>
+  <td>${escapeHtml(row.instance)}</td>
+  <td>${escapeHtml(row.account)}</td>
+  <td>${escapeHtml(row.release)}</td>
+  <td>${escapeHtml(row.firstDay)}</td>
+  <td>${escapeHtml(row.lastDay)}</td>
+  <td class="num">${row.deploys}</td>
+</tr>`,
+    )
+    .join("");
   const dailyRange = dailyFromHistory
     ? `Full history from durable rollups${deployTotals.firstDay ? ` (since ${escapeHtml(deployTotals.firstDay)})` : ""}.`
     : "Last 14 days from Analytics Engine. Longer history appears once the nightly rollup has run.";
@@ -239,6 +252,16 @@ export function metricsPage(
 <p class="prose">Server-recorded events from Workers Analytics Engine, with long-term history preserved in durable daily rollups. Counts are approximate and can take a few minutes to appear after each event.</p>
 <section class="stat-grid" aria-label="GSVs deployed">${statCards}</section>
 <p class="hint stat-note">Excludes the humans &amp; machines internal account. <strong>Accounts</strong> = distinct Cloudflare accounts; <strong>installs</strong> = distinct account + install name (someone running two named GSVs in one account counts as two). Both ignore redeploys/updates. <strong>Successful deploys</strong> is the only figure that counts every (re)deploy.</p>
+<section class="section">
+  <h2>All installs</h2>
+  <details class="install-list">
+    <summary>${installs.length} install${installs.length === 1 ? "" : "s"} &mdash; account, name, release, dates</summary>
+    <table class="metrics-table">
+      <thead><tr><th>Install</th><th>Account</th><th>Latest release</th><th>First deployed</th><th>Last deployed</th><th class="num">Deploys</th></tr></thead>
+      <tbody>${installListRows || `<tr><td colspan="6">No installs recorded yet.</td></tr>`}</tbody>
+    </table>
+  </details>
+</section>
 <section class="section">
   <h2>Recent deploys</h2>
   <table class="metrics-table">

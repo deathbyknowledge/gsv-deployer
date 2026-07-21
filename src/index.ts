@@ -29,7 +29,7 @@ import {
   requireMetricsAuth,
   trackRequestEvent,
 } from "./metrics";
-import { fetchDailyHistory, fetchDeployTotals, rollupHistory } from "./history";
+import { fetchDailyHistory, fetchDeployTotals, fetchInstallList, rollupHistory } from "./history";
 import type { AppEnv, DeployAdapterSecrets, DeployJob, DeployOptions } from "./types";
 
 const app = new Hono<AppEnv>();
@@ -232,13 +232,14 @@ app.get("/metrics", async (c) => {
   if (denied) return denied;
 
   try {
-    const [summary, aeDaily, byCountry, byHour, recentDeploys, deployTotals, history] = await Promise.all([
+    const [summary, aeDaily, byCountry, byHour, recentDeploys, deployTotals, installs, history] = await Promise.all([
       fetchMetricsSummary(c.env),
       fetchMetricsDaily(c.env),
       fetchMetricsByCountry(c.env),
       fetchMetricsByHour(c.env),
       fetchRecentDeploys(c.env),
       fetchDeployTotals(c.env),
+      fetchInstallList(c.env),
       fetchDailyHistory(c.env, 90),
     ]);
     // Durable rollups give the full funnel history; fall back to the 14-day AE
@@ -247,7 +248,7 @@ app.get("/metrics", async (c) => {
     const daily = dailyFromHistory ? history : aeDaily;
     return page(c, {
       title: "Metrics",
-      body: metricsPage(deployTotals, summary, daily, dailyFromHistory, byCountry, byHour, recentDeploys),
+      body: metricsPage(deployTotals, installs, summary, daily, dailyFromHistory, byCountry, byHour, recentDeploys),
       width: "wide",
     });
   } catch (error) {
