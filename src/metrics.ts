@@ -83,7 +83,7 @@ export async function fetchMetricsByCountry(env: AppEnv["Bindings"]): Promise<Me
     env,
     `SELECT blob3 AS country, count() AS hits
      FROM gsv_deploy_metrics
-     WHERE timestamp > NOW() - INTERVAL '30' DAY
+     WHERE timestamp > NOW() - INTERVAL '90' DAY
      GROUP BY country
      ORDER BY hits DESC
      LIMIT 20`,
@@ -96,7 +96,7 @@ export async function fetchMetricsByHour(env: AppEnv["Bindings"]): Promise<Metri
     env,
     `SELECT toHour(timestamp) AS hour, count() AS hits
      FROM gsv_deploy_metrics
-     WHERE timestamp > NOW() - INTERVAL '30' DAY
+     WHERE timestamp > NOW() - INTERVAL '90' DAY
      GROUP BY hour
      ORDER BY hour`,
   );
@@ -146,7 +146,7 @@ export async function fetchRecentDeploys(env: AppEnv["Bindings"]): Promise<Metri
   }));
 }
 
-async function runAnalyticsQuery<T>(env: AppEnv["Bindings"], sql: string): Promise<T[]> {
+export async function runAnalyticsQuery<T>(env: AppEnv["Bindings"], sql: string): Promise<T[]> {
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`, {
     method: "POST",
     headers: { Authorization: `Bearer ${env.CF_ANALYTICS_API_TOKEN}` },

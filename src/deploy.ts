@@ -668,7 +668,7 @@ async function recordDeploymentSuccess(
   const account = writer.job.options.accountName || writer.job.options.accountId;
   await writer.update({ status: "succeeded", result }, { flush: false });
   await writer.appendLog("info", "Deployment complete.", { flush: false });
-  trackEvent(env, "deploy_success", writer.job.options.version, "", writer.job.id, writer.job.options.instance, account);
+  trackEvent(env, "deploy_success", writer.job.options.version, "", writer.job.id, writer.job.options.instance, account, writer.job.options.accountId);
   await writer.flush(true);
 }
 
@@ -692,7 +692,7 @@ async function recordDeploymentFailureWithWriter(
   await writer.failActiveStep(friendlyErrorDetail(message), { flush: false });
   await writer.appendLog("error", message, { flush: false });
   await writer.update({ status: "failed", error: message }, { flush: false });
-  trackEvent(env, "deploy_failed", writer.job.options.version, "", writer.job.id, writer.job.options.instance, account);
+  trackEvent(env, "deploy_failed", writer.job.options.version, "", writer.job.id, writer.job.options.instance, account, writer.job.options.accountId);
   await writer.flush(true);
 }
 
