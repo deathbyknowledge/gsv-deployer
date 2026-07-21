@@ -238,7 +238,7 @@ export function metricsPage(
 <h1 class="page-title">GSV deploys &amp; funnel</h1>
 <p class="prose">Server-recorded events from Workers Analytics Engine, with long-term history preserved in durable daily rollups. Counts are approximate and can take a few minutes to appear after each event.</p>
 <section class="stat-grid" aria-label="GSVs deployed">${statCards}</section>
-<p class="hint stat-note">Deploy counts exclude the humans &amp; machines internal account. A GSV is one distinct account + install name; deploys count every successful (re)deploy.</p>
+<p class="hint stat-note">Excludes the humans &amp; machines internal account. <strong>Accounts</strong> = distinct Cloudflare accounts; <strong>installs</strong> = distinct account + install name (someone running two named GSVs in one account counts as two). Both ignore redeploys/updates. <strong>Successful deploys</strong> is the only figure that counts every (re)deploy.</p>
 <section class="section">
   <h2>Recent deploys</h2>
   <table class="metrics-table">
@@ -280,9 +280,10 @@ export function metricsPage(
 
 function deployStatCards(totals: DeployTotals): string {
   const cards: Array<{ label: string; value: number; sub: string }> = [
-    { label: "GSVs deployed", value: totals.installsAllTime, sub: "distinct installs, all time" },
-    { label: "New in 30 days", value: totals.installs30d, sub: "distinct installs" },
-    { label: "New in 7 days", value: totals.installs7d, sub: "distinct installs" },
+    { label: "Accounts", value: totals.accountsAllTime, sub: "distinct accounts, all time" },
+    { label: "GSV installs", value: totals.installsAllTime, sub: "distinct account + name, all time" },
+    { label: "New accounts · 30d", value: totals.accounts30d, sub: "distinct accounts" },
+    { label: "New installs · 30d", value: totals.installs30d, sub: "distinct installs" },
     { label: "Successful deploys", value: totals.deploysAllTime, sub: "all time, incl. updates" },
   ];
   return cards
