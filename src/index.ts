@@ -70,6 +70,7 @@ app.get("/", async (c) => {
   return page(c, {
     title: "Deploy GSV",
     body: homePage(c.env.GITHUB_REPO_URL),
+    canonicalPath: "/",
   });
 });
 
@@ -336,6 +337,7 @@ app.get("/privacy", (c) =>
   page(c, {
     title: "Privacy",
     body: `<p class="eyebrow">Privacy</p><h1 class="page-title">Privacy</h1><p class="prose">This installer stores Cloudflare OAuth session data server-side only long enough to perform deployment. Sessions expire automatically from KV; deployment state and credentials expire from isolated Durable Object storage.</p>`,
+    canonicalPath: "/privacy",
   }),
 );
 
@@ -343,8 +345,38 @@ app.get("/terms", (c) =>
   page(c, {
     title: "Terms",
     body: `<p class="eyebrow">Terms</p><h1 class="page-title">Terms</h1><p class="prose">This installer is provided as-is. Review the requested Cloudflare OAuth scopes and deployed GSV release before authorizing deployment.</p>`,
+    canonicalPath: "/terms",
   }),
 );
+
+app.get("/robots.txt", (c) =>
+  c.text(
+    [
+      "User-agent: *",
+      "Disallow: /login",
+      "Disallow: /logout",
+      "Disallow: /oauth/",
+      "Disallow: /deploy",
+      "Disallow: /jobs/",
+      "Disallow: /api/",
+      "Disallow: /metrics",
+      "Allow: /",
+      "",
+      `Sitemap: ${c.env.APP_ORIGIN}/sitemap.xml`,
+      "",
+    ].join("\n"),
+  ),
+);
+
+app.get("/sitemap.xml", (c) => {
+  const urls = ["/", "/privacy", "/terms"]
+    .map((path) => `  <url>\n    <loc>${c.env.APP_ORIGIN}${path}</loc>\n  </url>`)
+    .join("\n");
+  return new Response(
+    `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`,
+    { headers: { "Content-Type": "application/xml; charset=utf-8" } },
+  );
+});
 
 app.notFound((c) =>
   page(c, {
