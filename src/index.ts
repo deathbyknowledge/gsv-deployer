@@ -237,6 +237,19 @@ app.get("/metrics", async (c) => {
     const installsParam = c.req.query("installs");
     const installsIncludeInternal = installsParam === "all";
     const installsExpanded = installsParam === "all" || installsParam === "public";
+    // The install list and totals read from the D1 rollup tables, which the cron
+    // only refreshes nightly — without this, deploys made since the last run show
+    // under "Recent deploys" but are missing everywhere else. Fold the trailing
+    // window in first (idempotent); best-effort so a rollup failure still renders
+    // the page from the last good rollup.
+    await rollupHistory(c.env, 2).catch((error) => {
+      console.error(
+        JSON.stringify({
+          message: "On-view metrics rollup failed",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    });
     const [summary, aeDaily, byCountry, byHour, recentDeploys, deployTotals, installs, history] = await Promise.all([
       fetchMetricsSummary(c.env),
       fetchMetricsDaily(c.env),
