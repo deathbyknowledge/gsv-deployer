@@ -146,6 +146,52 @@ export async function fetchRecentDeploys(env: AppEnv["Bindings"]): Promise<Metri
   }));
 }
 
+// Daily visits/page views for the public gsv.space site from Cloudflare Web
+// Analytics (RUM), filtered by request host so no site-tag lookup is needed.
+// Requires the analytics token to carry Account Analytics Read in addition to
+// Analytics Engine access.
+export type GsvSiteDailyRow = { day: string; visits: number; pageViews: number };
+
+const GSV_SITE_HOSTS = ["gsv.space", "www.gsv.space"];
+
+export async function fetchGsvSiteDaily(env: AppEnv["Bindings"]): Promise<GsvSiteDailyRow[]> {
+  const since = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const response = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.CF_ANALYTICS_API_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: `query GsvSiteDaily($accountTag: string!, $hosts: [string!], $since: string!) {
+        viewer {
+          accounts(filter: { accountTag: $accountTag }) {
+            series: rumPageloadEventsAdaptiveGroups(
+              limit: 100
+              filter: { requestHost_in: $hosts, date_geq: $since }
+              orderBy: [date_ASC]
+            ) {
+              count
+              sum { visits }
+              dimensions { date }
+            }
+          }
+        }
+      }`,
+      variables: { accountTag: env.CF_ACCOUNT_ID, hosts: GSV_SITE_HOSTS, since },
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Web Analytics query failed with ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  }
+  const body = (await response.json()) as {
+    data?: { viewer?: { accounts?: Array<{ series?: Array<{ count: number; sum: { visits: number }; dimensions: { date: string } }> }> } };
+    errors?: Array<{ message: string }>;
+  };
+  if (body.errors?.length) {
+    throw new Error(`Web Analytics query failed: ${body.errors[0].message}`);
+  }
+  const series = body.data?.viewer?.accounts?.[0]?.series ?? [];
+  return series.map((row) => ({ day: row.dimensions.date, visits: row.sum.visits, pageViews: row.count }));
+}
+
 export async function runAnalyticsQuery<T>(env: AppEnv["Bindings"], sql: string): Promise<T[]> {
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`, {
     method: "POST",

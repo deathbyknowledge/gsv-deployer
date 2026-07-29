@@ -20,6 +20,7 @@ import { page } from "./html";
 import { fetchAccounts, getSessionWithId, handleCallback, logout, requireSession, startLogin } from "./oauth";
 import { deployPage, errorPage, homePage, jobPage, metricsPage, noAccountsPage } from "./pages";
 import {
+  fetchGsvSiteDaily,
   fetchMetricsByCountry,
   fetchMetricsByHour,
   fetchMetricsDaily,
@@ -302,6 +303,30 @@ app.post("/metrics/backfill", async (c) => {
     return c.json({ ok: true, ...result });
   } catch (error) {
     return c.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 502);
+  }
+});
+
+// Machine-readable metrics for the traction spreadsheet collector. Same basic
+// auth as /metrics. Web Analytics for gsv.space is best-effort: a failure there
+// (e.g. token missing the RUM scope) is reported inline instead of failing the
+// whole payload, so the deploy metrics keep flowing.
+app.get("/metrics.json", async (c) => {
+  const denied = requireMetricsAuth(c);
+  if (denied) return denied;
+
+  try {
+    const [summary, daily] = await Promise.all([fetchMetricsSummary(c.env), fetchMetricsDaily(c.env)]);
+    let gsvSite: Awaited<ReturnType<typeof fetchGsvSiteDaily>> | null = null;
+    let gsvSiteError: string | undefined;
+    try {
+      gsvSite = await fetchGsvSiteDaily(c.env);
+    } catch (error) {
+      gsvSiteError = error instanceof Error ? error.message : String(error);
+    }
+    return c.json({ generatedAt: new Date().toISOString(), summary, daily, gsvSite, gsvSiteError });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message }, 502);
   }
 });
 
