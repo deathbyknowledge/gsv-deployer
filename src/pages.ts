@@ -61,12 +61,15 @@ export function deployPage(
   installations: ExistingGsvInstallation[],
   prefill?: DeployPrefill,
 ): string {
-  const accountOptions = accounts
-    .map(
+  const retryAccountMissing =
+    prefill?.mode === "retry" && !accounts.some((account) => account.id === prefill.accountId);
+  const accountOptions = [
+    retryAccountMissing ? `<option value="" selected disabled>Choose an account for this retry</option>` : "",
+    ...accounts.map(
       (account) =>
         `<option value="${escapeHtml(account.id)}"${account.id === prefill?.accountId ? " selected" : ""}>${escapeHtml(displayAccount(account))}</option>`,
-    )
-    .join("");
+    ),
+  ].join("");
   const isUpdate = Boolean(prefill?.mode === "update" && prefill.accountId && prefill.instance);
 
   // The "new install name" field only applies to a new target; it is hidden when
@@ -99,7 +102,11 @@ export function deployPage(
     : `<label class="target-field-full">
       Cloudflare account
       <select name="accountId" required>${accountOptions}</select>
-      <span class="hint">Where this new GSV will be deployed.</span>
+      <span class="hint">${
+        retryAccountMissing
+          ? `The account used by the failed deployment${prefill?.accountId ? ` (${escapeHtml(prefill.accountId)})` : ""} is not currently authorized. Reauthorize it or deliberately choose another account.`
+          : "Where this new GSV will be deployed."
+      }</span>
     </label>`;
 
   const heading = isUpdate ? `Update ${escapeHtml(prefill!.instance!)}` : "Deploy a new GSV";
@@ -605,7 +612,18 @@ function renderReleaseOptions(releases: ReleaseOption[], selected?: string): str
           { value: "latest", label: "Latest stable", description: "Recommended for most installs." },
           { value: "dev", label: "Dev channel", description: "Newest prerelease build." },
         ];
-  return fallback
+  const options =
+    selected && !fallback.some((release) => release.value === selected)
+      ? [
+          {
+            value: selected,
+            label: `${selected} (previous selection)`,
+            description: "Release used by the previous deployment.",
+          },
+          ...fallback,
+        ]
+      : fallback;
+  return options
     .map(
       (release) =>
         `<option value="${escapeHtml(release.value)}"${release.value === selected ? " selected" : ""}>${escapeHtml(release.label)}</option>`,

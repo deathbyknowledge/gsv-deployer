@@ -155,6 +155,24 @@ describe("deployment compatibility", () => {
     expect(inconsistentName[0]).toEqual(expect.objectContaining({ deleteSupported: false }));
   });
 
+  it("prefers verified management tags over colliding legacy names", () => {
+    const account = { id: "account-id", name: "Account" };
+    const installations = detectGsvInstallations(account, [
+      { id: "gsv", tags: workerTags("gsv", "gateway") },
+      { id: "ripgit", tags: workerTags("gsv", "ripgit") },
+      { id: "gsv-ripgit" },
+    ]);
+
+    expect(installations).toEqual([
+      expect.objectContaining({
+        instance: "gsv",
+        components: ["ripgit", "gateway"],
+        scriptNames: ["ripgit", "gsv"],
+        deleteSupported: true,
+      }),
+    ]);
+  });
+
   it("keeps storage when any Worker deletion fails", async () => {
     const requests: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

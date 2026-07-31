@@ -925,12 +925,14 @@ export function detectGsvInstallations(
       components = new Map<string, DetectedComponent>();
       instances.set(instance, components);
     }
-    components.set(component, {
+    const candidate = {
       scriptName: script.id,
       verified:
         componentForInstallationScriptName(instance, script.id) === component &&
         hasExpectedWorkerTags(script.tags ?? [], instance, component),
-    });
+    };
+    const existing = components.get(component);
+    if (!existing?.verified || candidate.verified) components.set(component, candidate);
   };
 
   // Tags are authoritative and let us discover a named gateway even when it is

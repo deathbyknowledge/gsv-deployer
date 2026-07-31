@@ -60,6 +60,47 @@ describe("free deployment copy", () => {
     expect(invalidStackHelp.whatToDo).not.toMatch(/select .*component/i);
   });
 
+  it("preserves a retry release that is no longer in the release list", () => {
+    const retry = deployPage(
+      [{ id: "account-id", name: "Account" }],
+      "workers-scripts.write",
+      [
+        { value: "latest", label: "Latest stable", description: "Recommended." },
+        { value: "dev", label: "Dev channel", description: "Prerelease." },
+      ],
+      [],
+      {
+        mode: "retry",
+        accountId: "account-id",
+        instance: "gsv",
+        version: "v0.4.1",
+      },
+    );
+
+    expect(retry).toContain('<option value="v0.4.1" selected>v0.4.1 (previous selection)</option>');
+    expect(retry).not.toContain('<option value="latest" selected>');
+  });
+
+  it("requires an explicit account choice when the retry account is no longer authorized", () => {
+    const retry = deployPage(
+      [{ id: "another-account", name: "Another account" }],
+      "workers-scripts.write",
+      [],
+      [],
+      {
+        mode: "retry",
+        accountId: "original-account",
+        instance: "gsv",
+        version: "latest",
+      },
+    );
+
+    expect(retry).toContain('<option value="" selected disabled>Choose an account for this retry</option>');
+    expect(retry).not.toContain('<option value="another-account" selected>');
+    expect(retry).toContain("original-account");
+    expect(retry).toContain("is not currently authorized");
+  });
+
   it("presents installations as managed cards and separates new deployment", () => {
     const overview = managePage([
       {
