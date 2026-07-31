@@ -606,7 +606,6 @@ function displayAccount(account: Account): string {
 
 const SCOPE_LABELS: Record<string, string> = {
   "account-settings.read": "Read account settings",
-  "billing.read": "Check whether the account uses Workers Free or Paid",
   "user-details.read": "Read your user details",
   "memberships.read": "List your account memberships",
   "workers-scripts.read": "Read Worker scripts",
