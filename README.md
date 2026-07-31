@@ -60,6 +60,15 @@ curl https://api.cloudflare.com/client/v4/oauth/scopes \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
 ```
 
+The installer uses `billing.read` only to check whether the selected account
+has an active Workers Paid subscription. Free accounts—and accounts whose plan
+cannot be verified—are deployed without CodeMode's Worker Loader binding or
+ripgit's paid-only CPU limit.
+
+Component compatibility comes from each release's checksum manifest. Releases
+that publish the legacy assembler bundle deploy it automatically with the
+gateway; releases without that checksum never attempt to fetch or deploy it.
+
 Set the deployed installer URL in `APP_ORIGIN`, then set secrets:
 
 ```bash

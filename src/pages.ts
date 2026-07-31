@@ -24,9 +24,9 @@ export function homePage(repoUrl: string): string {
       <p class="home-label">Cloud computer</p>
       <h1>GSV</h1>
       <p class="lede">a mind for your machines</p>
-      <p class="prose">GSV is a personal AI computer that spans all your devices at once and stays awake even when they're asleep. One mind across all your machines, not stuck on any single one. Open source, running on the edge in your own Cloudflare account: your keys, your data. From ~$5/mo infra plus your own model costs. No box to babysit.</p>
+      <p class="prose">GSV is a personal AI computer that spans all your devices at once and stays awake even when they're asleep. One mind across all your machines, not stuck on any single one. Open source, running on the edge in your own Cloudflare account: your keys, your data. Start on Cloudflare's Free plan and pay only for the model usage you choose. No box to babysit.</p>
       <p class="prose"><a href="https://docs.gsv.space/get-started/"><em>Get started guide</em></a></p>
-      <p class="prose"><u>Cloudflare account on a Workers Paid plan (~$5/mo) and R2 object storage enabled required.</u></p>
+      <p class="prose"><u>Workers Free is supported. Workers Paid enables CodeMode and more CPU; R2 object storage must be enabled.</u></p>
       <div class="actions">
         <a class="button" href="/login">Log in with Cloudflare</a>
       </div>
@@ -667,7 +667,7 @@ function componentName(component: string): string {
     case "ripgit":
       return "Storage";
     case "assembler":
-      return "Package builder";
+      return "Legacy package builder";
     case "gateway":
       return "Core GSV";
     case "channel-whatsapp":
@@ -685,8 +685,6 @@ function componentHint(component: string): string {
   switch (component) {
     case "ripgit":
       return "Home files, Wiki, package source, artifacts, and process state.";
-    case "assembler":
-      return "Builds and installs GSV package apps.";
     case "gateway":
       return "Desktop, users, agents, files, settings, and setup.";
     case "channel-whatsapp":

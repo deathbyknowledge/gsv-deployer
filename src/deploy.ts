@@ -18,7 +18,7 @@ import type {
 
 const COMPONENT_GATEWAY = "gateway";
 const COMPONENT_RIPGIT = "ripgit";
-const COMPONENT_ASSEMBLER = "assembler";
+const LEGACY_COMPONENT_ASSEMBLER = "assembler";
 const COMPONENT_CHANNEL_WHATSAPP = "channel-whatsapp";
 const COMPONENT_CHANNEL_DISCORD = "channel-discord";
 const COMPONENT_CHANNEL_TELEGRAM = "channel-telegram";
@@ -27,11 +27,12 @@ const BUNDLE_CHECKSUMS = "cloudflare-checksums.txt";
 const DEFAULT_DEPLOY_INSTANCE = "gsv";
 const DEFAULT_STORAGE_BUCKET_NAME = "gsv-storage";
 const SCRIPT_GATEWAY = "gsv";
-const SCRIPT_ASSEMBLER = "gsv-assembler";
 const SCRIPT_RIPGIT = "ripgit";
+const LEGACY_SCRIPT_ASSEMBLER = "gsv-assembler";
 const SCRIPT_CHANNEL_WHATSAPP = "gsv-channel-whatsapp";
 const SCRIPT_CHANNEL_DISCORD = "gsv-channel-discord";
 const SCRIPT_CHANNEL_TELEGRAM = "gsv-channel-telegram";
+const RIPGIT_PAID_CPU_LIMIT_MS = 300_000;
 const WORKERS_SUBDOMAIN_API_DATE = "2025-08-01";
 const MAX_SOURCE_MAP_UPLOAD_BYTES = 2 * 1024 * 1024;
 const DEPLOY_WORKFLOW_STEP_CONFIG = {
@@ -49,7 +50,6 @@ const CLEANUP_WORKFLOW_STEP_CONFIG = {
 
 export const ALL_COMPONENTS = [
   COMPONENT_RIPGIT,
-  COMPONENT_ASSEMBLER,
   COMPONENT_GATEWAY,
   COMPONENT_CHANNEL_WHATSAPP,
   COMPONENT_CHANNEL_DISCORD,
@@ -57,7 +57,7 @@ export const ALL_COMPONENTS = [
 ] as const;
 
 const COMPONENT_TO_BUNDLE: Record<string, string> = {
-  [COMPONENT_ASSEMBLER]: "gsv-cloudflare-assembler.tar.gz",
+  [LEGACY_COMPONENT_ASSEMBLER]: "gsv-cloudflare-assembler.tar.gz",
   [COMPONENT_GATEWAY]: "gsv-cloudflare-gateway.tar.gz",
   [COMPONENT_RIPGIT]: "gsv-cloudflare-ripgit.tar.gz",
   [COMPONENT_CHANNEL_WHATSAPP]: "gsv-cloudflare-channel-whatsapp.tar.gz",
@@ -185,6 +185,14 @@ type WorkerScriptSummary = {
   migration_tag?: string | null;
 };
 
+type CloudflareSubscription = {
+  rate_plan?: {
+    id?: string;
+    scope?: string;
+  };
+  state?: string;
+};
+
 type AssetsUploadSessionResponse = {
   jwt?: string;
   buckets?: string[][];
@@ -214,6 +222,7 @@ type DeploymentPlan = {
 
 type DeploymentPreflight = {
   accountSubdomain: string | null;
+  workersPaid: boolean;
 };
 
 type DeploymentResult = {
@@ -527,22 +536,24 @@ async function prepareDeploymentPlan(
   logger: DeployLogger,
 ): Promise<DeploymentPlan> {
   const instance = parseInstance(options.instance);
-  const components = normalizeComponents(options.components).sort((a, b) => deployOrder(a) - deployOrder(b));
-  if (components.length === 0) throw new Error("No components selected.");
+  const requestedComponents = normalizeComponents(options.components).sort((a, b) => deployOrder(a) - deployOrder(b));
+  if (requestedComponents.length === 0) throw new Error("No components selected.");
 
   const repoOwner = env.GSV_REPO_OWNER || "deathbyknowledge";
   const repoName = env.GSV_REPO_NAME || "gsv";
   await logger.step("release", "running", "Looking up the requested GSV release.");
   const version = await resolveReleaseTag(repoOwner, repoName, options.version, logger);
   await logger.step("release", "complete", `Using ${version}.`);
-  await logger.info(`Preparing ${components.join(", ")} from ${version}.`);
+  await logger.info(`Preparing ${requestedComponents.join(", ")} from ${version}.`);
 
-  await logger.step("prepare", "running", `Downloading and verifying ${formatCount(components.length, "component")}.`);
+  await logger.step("prepare", "running", "Downloading and verifying the selected release components.");
   const artifactCachePrefix = deploymentArtifactCachePrefix(jobId);
-  await prepareBundles(env, repoOwner, repoName, version, components, instance, logger, {
+  const prepared = await prepareBundles(env, repoOwner, repoName, version, requestedComponents, instance, logger, {
     kind: "release",
     snapshotPrefix: artifactCachePrefix,
   });
+  const components = prepared.map((bundle) => bundle.component);
+  if (components.length === 0) throw new Error(`None of the selected components are available in ${version}.`);
   await logger.step("prepare", "complete", "GSV components are verified and ready.");
 
   return { repoOwner, repoName, version, instance, components, artifactCachePrefix };
@@ -556,7 +567,10 @@ async function inspectDeploymentTarget(
   logger: DeployLogger,
 ): Promise<DeploymentPreflight> {
   const selectedComponents = new Set(plan.components);
-  const existingScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
+  const [existingScriptsWithMigrations, workersPaid] = await Promise.all([
+    listWorkerScripts(accessToken, accountId),
+    resolveWorkersPaid(accessToken, accountId, logger),
+  ]);
   const existingScripts = new Set([...existingScriptsWithMigrations.keys()]);
   assertGatewayDependenciesAvailable(
     selectedComponents,
@@ -570,7 +584,7 @@ async function inspectDeploymentTarget(
   await logger.step("storage", "complete", "Storage resources are ready.");
 
   const accountSubdomain = await fetchAccountWorkersSubdomain(accessToken, accountId, logger);
-  return { accountSubdomain };
+  return { accountSubdomain, workersPaid };
 }
 
 async function deployWorkerScripts(
@@ -608,6 +622,7 @@ async function deployWorkerScripts(
       scriptExists: existingScriptsWithMigrations.has(bundle.scriptName),
       uploadedAssets,
       keepAssets: false,
+      workersPaid: preflight.workersPaid,
       logger,
     });
     await uploadWorkerScript(accessToken, accountId, bundle, metadata, false);
@@ -650,6 +665,7 @@ async function finalizeWorkerBindings(
       scriptExists: true,
       uploadedAssets: null,
       keepAssets: hasAssets(bundle),
+      workersPaid: preflight.workersPaid,
       logger,
     });
     await uploadWorkerScript(accessToken, accountId, bundle, metadata, true);
@@ -792,6 +808,29 @@ function normalizeComponents(raw: string[]): string[] {
   return out;
 }
 
+export function resolveReleaseComponents(
+  requestedComponents: string[],
+  checksums: ReadonlyMap<string, string>,
+): string[] {
+  const resolved = new Set<string>();
+  for (const component of requestedComponents) {
+    const bundleFile = COMPONENT_TO_BUNDLE[component];
+    if (!bundleFile) throw new Error(`Unknown component: ${component}`);
+    if (checksums.has(bundleFile)) {
+      resolved.add(component);
+    } else if (component !== LEGACY_COMPONENT_ASSEMBLER) {
+      throw new Error(`Missing checksum entry for ${bundleFile}.`);
+    }
+  }
+
+  const assemblerBundle = COMPONENT_TO_BUNDLE[LEGACY_COMPONENT_ASSEMBLER];
+  if (resolved.has(COMPONENT_GATEWAY) && checksums.has(assemblerBundle)) {
+    resolved.add(LEGACY_COMPONENT_ASSEMBLER);
+  }
+
+  return [...resolved].sort((a, b) => deployOrder(a) - deployOrder(b));
+}
+
 function dedupeReleaseOptions(options: ReleaseOption[]): ReleaseOption[] {
   const seen = new Set<string>();
   const out: ReleaseOption[] = [];
@@ -846,7 +885,7 @@ function componentForScriptName(scriptName: string): { instance: string; compone
     ["-channel-whatsapp", COMPONENT_CHANNEL_WHATSAPP],
     ["-channel-discord", COMPONENT_CHANNEL_DISCORD],
     ["-channel-telegram", COMPONENT_CHANNEL_TELEGRAM],
-    ["-assembler", COMPONENT_ASSEMBLER],
+    ["-assembler", LEGACY_COMPONENT_ASSEMBLER],
     ["-ripgit", COMPONENT_RIPGIT],
   ];
   for (const [suffix, component] of suffixes) {
@@ -878,7 +917,7 @@ function deployOrder(component: string): number {
   switch (component) {
     case COMPONENT_RIPGIT:
       return 0;
-    case COMPONENT_ASSEMBLER:
+    case LEGACY_COMPONENT_ASSEMBLER:
       return 1;
     case COMPONENT_CHANNEL_WHATSAPP:
       return 2;
@@ -928,7 +967,7 @@ function scriptNameForComponent(instance: DeployInstance, component: string): st
   switch (component) {
     case COMPONENT_GATEWAY:
       return instance.name;
-    case COMPONENT_ASSEMBLER:
+    case LEGACY_COMPONENT_ASSEMBLER:
       return `${instance.name}-assembler`;
     case COMPONENT_RIPGIT:
       return instance.isDefault ? SCRIPT_RIPGIT : `${instance.name}-ripgit`;
@@ -964,8 +1003,11 @@ function assertGatewayDependenciesAvailable(
   if (!availableScripts.has(scriptNameForComponent(instance, COMPONENT_RIPGIT))) {
     throw new Error("Deploying gateway requires ripgit. Select ripgit or deploy it first.");
   }
-  if (!availableScripts.has(scriptNameForComponent(instance, COMPONENT_ASSEMBLER))) {
-    throw new Error("Deploying gateway requires assembler. Select assembler or deploy it first.");
+  if (
+    selectedComponents.has(LEGACY_COMPONENT_ASSEMBLER) &&
+    !availableScripts.has(scriptNameForComponent(instance, LEGACY_COMPONENT_ASSEMBLER))
+  ) {
+    throw new Error("The selected gateway release requires the legacy assembler Worker.");
   }
 }
 
@@ -973,8 +1015,8 @@ function scriptNameForConfigService(instance: DeployInstance, service: string): 
   switch (service) {
     case SCRIPT_GATEWAY:
       return scriptNameForComponent(instance, COMPONENT_GATEWAY);
-    case SCRIPT_ASSEMBLER:
-      return scriptNameForComponent(instance, COMPONENT_ASSEMBLER);
+    case LEGACY_SCRIPT_ASSEMBLER:
+      return scriptNameForComponent(instance, LEGACY_COMPONENT_ASSEMBLER);
     case SCRIPT_RIPGIT:
       return scriptNameForComponent(instance, COMPONENT_RIPGIT);
     case SCRIPT_CHANNEL_WHATSAPP:
@@ -1083,10 +1125,18 @@ async function prepareBundles(
   const checksumsAsset = await fetchReleaseAsset(env, repoOwner, repoName, version, BUNDLE_CHECKSUMS, "Fetch bundle checksums", logger, source);
   const checksumsText = decodeText(checksumsAsset.bytes);
   const checksums = parseChecksums(checksumsText);
+  const releaseComponents = resolveReleaseComponents(components, checksums);
+  const requestedAssembler = components.includes(LEGACY_COMPONENT_ASSEMBLER);
+  const releaseHasAssembler = releaseComponents.includes(LEGACY_COMPONENT_ASSEMBLER);
+  if (!requestedAssembler && releaseHasAssembler) {
+    await logger.info("This release requires the legacy assembler Worker; including it automatically.");
+  } else if (requestedAssembler && !releaseHasAssembler) {
+    await logger.info("This release does not include the legacy assembler Worker; skipping it.");
+  }
   const bundles: PreparedBundle[] = [];
   const validatedAssets: FetchedReleaseAsset[] = [checksumsAsset];
 
-  for (const component of components) {
+  for (const component of releaseComponents) {
     const bundleFile = COMPONENT_TO_BUNDLE[component];
     const expected = checksums.get(bundleFile);
     if (!expected) throw new Error(`Missing checksum entry for ${bundleFile}.`);
@@ -1453,6 +1503,46 @@ async function listWorkerScripts(accessToken: string, accountId: string): Promis
   return out;
 }
 
+function subscriptionIsActive(state: string | undefined): boolean {
+  const normalized = state?.trim().toLowerCase();
+  return normalized === "trial" || normalized === "provisioned" || normalized === "paid";
+}
+
+export function workersPaidFromSubscriptions(subscriptions: CloudflareSubscription[]): boolean {
+  return subscriptions.some((subscription) =>
+    subscriptionIsActive(subscription.state) &&
+    subscription.rate_plan?.scope?.trim().toLowerCase() === "account" &&
+    subscription.rate_plan?.id?.trim().toLowerCase() === "workers_paid"
+  );
+}
+
+async function resolveWorkersPaid(
+  accessToken: string,
+  accountId: string,
+  logger: DeployLogger,
+): Promise<boolean> {
+  try {
+    const subscriptions = await cloudflareApi<CloudflareSubscription[]>(
+      accessToken,
+      `/accounts/${accountId}/subscriptions`,
+      {},
+      "List account subscriptions",
+    );
+    const workersPaid = workersPaidFromSubscriptions(subscriptions);
+    await logger.info(
+      workersPaid
+        ? "Workers Paid verified; enabling CodeMode and ripgit's extended CPU limit."
+        : "Workers Free detected; omitting CodeMode and paid-only Worker limits.",
+    );
+    return workersPaid;
+  } catch (error) {
+    await logger.warning(
+      `Could not verify the Workers plan; deploying the Free-compatible configuration without CodeMode or paid-only Worker limits: ${error instanceof Error ? error.message : String(error)}.`,
+    );
+    return false;
+  }
+}
+
 async function ensureR2Bucket(
   accessToken: string,
   accountId: string,
@@ -1554,6 +1644,7 @@ type MetadataOptions = {
   scriptExists: boolean;
   uploadedAssets: UploadedAssets | null;
   keepAssets: boolean;
+  workersPaid: boolean;
   logger: InfoLogger;
 };
 
@@ -1611,8 +1702,10 @@ export async function buildUploadMetadata(
     bindings.push(value);
   }
 
-  for (const loader of bundle.wrangler.worker_loaders ?? []) {
-    bindings.push({ name: loader.binding, type: "worker_loader" });
+  if (options.workersPaid) {
+    for (const loader of bundle.wrangler.worker_loaders ?? []) {
+      bindings.push({ name: loader.binding, type: "worker_loader" });
+    }
   }
 
   if (bundle.wrangler.ai) {
@@ -1654,13 +1747,20 @@ export async function buildUploadMetadata(
     }
   }
   if (bundle.wrangler.observability) metadata.observability = bundle.wrangler.observability;
-  if (bundle.wrangler.limits) metadata.limits = bundle.wrangler.limits;
+  const paidLimits = paidLimitsForBundle(bundle);
+  if (options.workersPaid && paidLimits) metadata.limits = paidLimits;
   if (options.uploadedAssets) {
     metadata.assets = { jwt: options.uploadedAssets.jwt, config: options.uploadedAssets.config };
   }
   if (options.keepAssets) metadata.keep_assets = true;
 
   return metadata;
+}
+
+function paidLimitsForBundle(bundle: PreparedBundle): NonNullable<WranglerConfig["limits"]> | undefined {
+  if (bundle.wrangler.limits) return bundle.wrangler.limits;
+  if (bundle.component === COMPONENT_RIPGIT) return { cpu_ms: RIPGIT_PAID_CPU_LIMIT_MS };
+  return undefined;
 }
 
 function serviceBindingsForBundle(
