@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { getDeployHelp } from "../src/deploy-help";
-import { deployPage, homePage, managePage } from "../src/pages";
+import { confirmDeletePage, deployPage, homePage, managePage } from "../src/pages";
 
 describe("free deployment copy", () => {
   it("explains the billing scope and paid-only CodeMode capability", () => {
@@ -13,9 +13,10 @@ describe("free deployment copy", () => {
     );
 
     expect(deploy).toContain("Check whether the account uses Workers Free or Paid");
-    expect(homePage("https://github.com/example/gsv")).toContain(
-      "Free installs omit this paid-only capability",
-    );
+    const home = homePage("https://github.com/example/gsv");
+    expect(home).toContain("Workers Free is supported");
+    expect(home).toContain("Workers Paid adds CodeMode and more CPU");
+    expect(home).not.toContain("packages");
   });
 
   it("does not tell free-account users to upgrade when storage setup fails", () => {
@@ -30,7 +31,13 @@ describe("free deployment copy", () => {
     expect(dependencyHelp.whatToDo).toContain("Legacy releases");
   });
 
-  it("describes update component selection without implying removal", () => {
+  it("keeps internal Worker components out of deployment choices", () => {
+    const create = deployPage(
+      [{ id: "account-id", name: "Account" }],
+      "workers-scripts.write",
+      [],
+      [],
+    );
     const update = deployPage(
       [{ id: "account-id", name: "Account" }],
       "workers-scripts.write",
@@ -40,15 +47,57 @@ describe("free deployment copy", () => {
         mode: "update",
         accountId: "account-id",
         instance: "gsv",
-        components: ["ripgit", "gateway"],
       },
     );
 
-    expect(update).toContain("Components left unchecked are not removed");
-    expect(update).toContain("Unchecked existing components stay deployed");
+    expect(create).toContain("installer handles the complete stack");
+    expect(create).not.toContain('name="component"');
+    expect(create).not.toContain("Discord bot token");
+    expect(update).toContain("complete GSV installation");
+    expect(update).not.toContain('name="component"');
+
+    const invalidStackHelp = getDeployHelp("No components selected.");
+    expect(invalidStackHelp.whatToDo).not.toMatch(/select .*component/i);
   });
 
-  it("does not offer browser deletion for an untagged legacy install", () => {
+  it("presents installations as managed cards and separates new deployment", () => {
+    const overview = managePage([
+      {
+        accountId: "account-id",
+        accountName: "Account",
+        instance: "gsv",
+        components: ["ripgit", "gateway"],
+        scriptNames: ["ripgit", "gsv"],
+        deleteSupported: true,
+      },
+    ]);
+
+    expect(overview).toContain("Manage your existing GSVs");
+    expect(overview).toContain('class="manage-card"');
+    expect(overview).toContain("Managed install");
+    expect(overview).toContain("Want to deploy a new one?");
+    expect(overview).not.toContain("component-badges");
+    expect(overview).not.toContain("<li class=\"manage-card\"");
+  });
+
+  it("summarizes deletion outcomes before showing Worker IDs", () => {
+    const confirmation = confirmDeletePage({
+      accountId: "account-id",
+      accountName: "Account",
+      instance: "gsv",
+      components: ["ripgit", "gateway"],
+      scriptNames: ["ripgit", "gsv"],
+      deleteSupported: true,
+    });
+
+    expect(confirmation).toContain("GSV and its connected services");
+    expect(confirmation).toContain("Your files and storage");
+    expect(confirmation).toContain("Technical details");
+    expect(confirmation.indexOf("Technical details")).toBeLessThan(confirmation.indexOf("ripgit"));
+    expect(confirmation).toContain("This does not delete files");
+  });
+
+  it("keeps name-matched installations unverified when management tags are absent", () => {
     const overview = managePage([
       {
         accountId: "account-id",
@@ -60,7 +109,8 @@ describe("free deployment copy", () => {
       },
     ]);
 
-    expect(overview).toContain("may be a legacy install or a name collision");
+    expect(overview).toContain("Unverified install");
+    expect(overview).toContain("legacy GSV installation or a name collision");
     expect(overview).not.toContain("/manage/delete?");
   });
 });

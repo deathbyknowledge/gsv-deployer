@@ -1,12 +1,12 @@
 import type { Account, DeployJob } from "./types";
-import { ALL_COMPONENTS, storageBucketNameForInstance } from "./deploy";
+import { storageBucketNameForInstance } from "./deploy";
 import type { ExistingGsvInstallation, ReleaseOption } from "./deploy";
 import { getDeployHelp } from "./deploy-help";
 import { cloudflareMark, discordIcon, escapeHtml, octocatIcon, xIcon } from "./html";
-
-const HELP_DISCORD_URL = "https://discord.gg/hy9ExJJFvn";
 import type { MetricsCountryRow, MetricsDailyRow, MetricsHourRow, MetricsRecentDeployRow, MetricsSummaryRow } from "./metrics";
 import type { DeployTotals, InstallRow } from "./history";
+
+const HELP_DISCORD_URL = "https://discord.gg/hy9ExJJFvn";
 
 export function homePage(repoUrl: string): string {
   return `<section class="home-sheet">
@@ -21,34 +21,29 @@ export function homePage(repoUrl: string): string {
   </header>
   <div class="home-intro">
     <article class="home-copy">
-      <p class="home-label">Cloud computer</p>
-      <h1>GSV</h1>
-      <p class="lede">a mind for your machines</p>
-      <p class="prose">GSV is a personal AI computer that spans all your devices at once and stays awake even when they're asleep. One mind across all your machines, not stuck on any single one. Open source, running on the edge in your own Cloudflare account: your keys, your data. Start on Cloudflare's Free plan and pay only for the model usage you choose. No box to babysit.</p>
-      <p class="prose"><a href="https://docs.gsv.space/get-started/"><em>Get started guide</em></a></p>
-      <p class="prose"><u>Workers Free is supported. Workers Paid enables CodeMode and more CPU; R2 object storage must be enabled.</u></p>
+      <p class="home-label">GSV on Cloudflare</p>
+      <h1>Deploy GSV to your Cloudflare account</h1>
+      <p class="lede">Your personal AI computer, running on infrastructure you control.</p>
+      <p class="prose">This installer connects directly to Cloudflare and deploys GSV into your account. Your Workers, data, and credentials stay yours.</p>
       <div class="actions">
-        <a class="button" href="/login">Log in with Cloudflare</a>
+        <a class="button" href="/login">Continue with Cloudflare</a>
+        <a class="link-button" href="https://docs.gsv.space/get-started/">Read the guide</a>
       </div>
     </article>
     <div class="home-side">
-      <p class="manifest-intro">Everything below deploys to your own Cloudflare account. Nothing runs on ours.</p>
-      <dl class="home-facts" aria-label="What deploys">
-        <div><dt>Core GSV</dt><dd>Desktop, users, agents, and settings. Runs as Workers + Durable Objects.</dd></div>
-        <div><dt>Storage</dt><dd>Your files, Wiki, packages, and process state, in your own R2 bucket.</dd></div>
-        <div><dt>CodeMode</dt><dd>Builds and installs GSV apps on Workers Paid; Free installs omit this paid-only capability.</dd></div>
-        <div><dt>Channels</dt><dd>Optional. Connect WhatsApp, Discord, or Telegram to chat with GSV from anywhere.</dd></div>
+      <p class="manifest-intro">Before you start</p>
+      <dl class="home-facts" aria-label="Cloudflare requirements">
+        <div><dt>Plan</dt><dd>Workers Free is supported. Workers Paid adds CodeMode and more CPU.</dd></div>
+        <div><dt>Storage</dt><dd>R2 object storage must be enabled in the account you choose.</dd></div>
+        <div><dt>Models</dt><dd>Connect your preferred model provider during GSV setup.</dd></div>
       </dl>
     </div>
   </div>
 </section>
-<section class="home-manifest">
-  <div class="manifest-grid">
-    <div><strong>Devices</strong><span>Connect every machine you own: laptops, servers, workstations. GSV works across all of them at once, where your files and tools already live.</span></div>
-    <div><strong>Agents</strong><span>Personal, custom, and background agents that work on your behalf, even when your devices are asleep.</span></div>
-    <div><strong>Desktop</strong><span>Chat, Files, Shell, and Wiki in one console. One place to drive the whole system.</span></div>
-    <div><strong>Knowledge</strong><span>Files and Wiki keep what matters after a conversation ends. Your system remembers.</span></div>
-  </div>
+<section class="home-steps" aria-label="Deployment steps">
+  <div><span>01</span><strong>Connect Cloudflare</strong><p>Authorize only the access the installer needs.</p></div>
+  <div><span>02</span><strong>Deploy GSV</strong><p>Choose an account and let the installer handle the complete stack.</p></div>
+  <div><span>03</span><strong>Finish setup</strong><p>Open your GSV, create your user, and connect a model.</p></div>
 </section>`;
 }
 
@@ -57,7 +52,6 @@ export type DeployPrefill = {
   accountId?: string;
   instance?: string;
   version?: string;
-  components?: string[];
 };
 
 export function deployPage(
@@ -73,20 +67,19 @@ export function deployPage(
         `<option value="${escapeHtml(account.id)}"${account.id === prefill?.accountId ? " selected" : ""}>${escapeHtml(displayAccount(account))}</option>`,
     )
     .join("");
-  const selectedComponents = prefill?.components ? new Set(prefill.components) : null;
-  const componentChecks = ALL_COMPONENTS.map((component) =>
-    componentControl(component, selectedComponents ? selectedComponents.has(component) : true),
-  ).join("");
   const isUpdate = Boolean(prefill?.mode === "update" && prefill.accountId && prefill.instance);
 
   // The "new install name" field only applies to a new target; it is hidden when
   // updating an existing install (its name is fixed by the chosen target).
   const instanceValue = (!isUpdate && prefill?.instance) || "gsv";
-  const advancedOpen = !isUpdate && instanceValue !== "gsv" ? " open" : "";
+  const advancedOpen =
+    prefill?.mode === "retry" || instanceValue !== "gsv" || (prefill?.version && prefill.version !== "latest")
+      ? " open"
+      : "";
   const note = isUpdate
-    ? `<p class="prose retry-note">Choose a release and the components to deploy or refresh, then apply the update. Components left unchecked are not removed. Any Discord or Telegram bot tokens need to be re-entered.</p>`
+    ? ""
     : prefill
-      ? `<p class="prose retry-note">Retrying your last deployment. Review the settings below and deploy again. Any Discord or Telegram bot tokens need to be re-entered.</p>`
+      ? `<p class="prose retry-note">Retrying your last deployment. Review the settings below and deploy again.</p>`
       : "";
 
   // In update mode the target is fixed and carried in a hidden field so the
@@ -111,25 +104,28 @@ export function deployPage(
 
   const heading = isUpdate ? `Update ${escapeHtml(prefill!.instance!)}` : "Deploy a new GSV";
   const intro = isUpdate
-    ? "Choose the release and components to deploy or refresh for this GSV."
-    : "Choose where this GSV should live and which release to install.";
-  // Advanced options only apply to a new deploy: the install name and the
-  // read-only summary of the Cloudflare access you granted at login. Updating an
-  // existing install changes neither, so the whole section is dropped there.
-  const advancedSection = isUpdate
+    ? "Apply a release to the complete GSV installation. Your files and settings stay in place."
+    : "Choose the Cloudflare account where your GSV should live. The installer handles the complete stack.";
+  const installOptions = isUpdate
     ? ""
-    : `<details class="advanced"${advancedOpen}>
-    <summary>Advanced</summary>
-    <label>
+    : `<label>
       Install name
-      <input name="instance" value="${escapeHtml(instanceValue)}" pattern="[a-z0-9-]+" required>
+      <input name="instance" value="${escapeHtml(instanceValue)}" pattern="[a-z0-9-]+" autocomplete="off" required>
       <span class="hint">Pick a unique name such as gsv-personal when running multiple GSVs in one account.</span>
     </label>
     <div class="panel scope-panel">
       <strong>What this installer can access</strong>
       <p class="hint">Cloudflare OAuth permissions you granted at login.</p>
       <ul class="scope-list">${renderScopeList(scopes)}</ul>
-    </div>
+    </div>`;
+  const advancedSection = `<details class="advanced"${advancedOpen}>
+    <summary>Advanced options</summary>
+    <label>
+      Release
+      <select name="version" required>${renderReleaseOptions(releases, prefill?.version)}</select>
+      <span class="hint">Use latest stable unless you need a specific release.</span>
+    </label>
+    ${installOptions}
   </details>`;
   const submitLabel = isUpdate ? `Update ${escapeHtml(prefill!.instance!)}` : "Deploy";
 
@@ -141,16 +137,6 @@ ${note}
   <div>
     <h2>${isUpdate ? "GSV" : "Where"}</h2>
     ${targetSection}
-  </div>
-  <label>
-    Release
-    <select name="version" required>${renderReleaseOptions(releases, prefill?.version)}</select>
-    <span class="hint">Exact release tags are loaded from GitHub. Use latest stable unless you need a specific build.</span>
-  </label>
-  <div>
-    <h2>Components</h2>
-    ${isUpdate ? `<p class="hint">Unchecked existing components stay deployed.</p>` : ""}
-    <div class="checks">${componentChecks}</div>
   </div>
   ${advancedSection}
   <div class="actions left">
@@ -165,7 +151,6 @@ function manageUpdateHref(install: ExistingGsvInstallation): string {
     update: "1",
     accountId: install.accountId,
     instance: install.instance,
-    components: install.components.join(","),
   });
   return `/deploy?${params.toString()}`;
 }
@@ -179,63 +164,65 @@ function manageDeleteHref(install: ExistingGsvInstallation): string {
 }
 
 export function managePage(installations: ExistingGsvInstallation[]): string {
-  if (installations.length === 0) {
-    return `<p class="eyebrow"><a href="/logout">Log out</a></p>
-<h1 class="page-title title-row">${cloudflareMark()} Your GSVs</h1>
-<p class="prose">No GSV installs were detected in your Cloudflare accounts yet. Deploy your first one to get started.</p>
-<div class="actions left">
-  <a class="button" href="/deploy">Deploy your first GSV</a>
-</div>`;
-  }
-
   const cards = installations
     .map(
-      (install) => `<li class="manage-card">
+      (install) => `<article class="manage-card">
   <div class="manage-card-head">
-    <strong>${escapeHtml(install.instance)}</strong>
-    <span class="hint">${escapeHtml(install.accountName)}</span>
+    <div>
+      <strong>${escapeHtml(install.instance)}</strong>
+      <span class="hint">${escapeHtml(install.accountName)}</span>
+    </div>
+    <span class="install-status ${install.deleteSupported ? "managed" : "unverified"}">${install.deleteSupported ? "Managed install" : "Unverified install"}</span>
   </div>
-  <span class="component-badges">${install.components.map((component) => `<span>${escapeHtml(componentName(component))}</span>`).join("")}</span>
+  ${install.deleteSupported ? `<p class="hint">Ready to update or remove from this installer.</p>` : `<p class="hint">These Workers match GSV's older names, but their management tags don't verify ownership. This may be a legacy GSV installation or a name collision. Verify them in Cloudflare before updating or removing anything. Deletion stays disabled here.</p>`}
   <div class="actions left">
     <a class="link-button" href="${escapeHtml(manageUpdateHref(install))}">Update</a>
     ${install.deleteSupported ? `<a class="link-button danger" href="${escapeHtml(manageDeleteHref(install))}">Delete</a>` : ""}
   </div>
-  ${install.deleteSupported ? "" : `<p class="hint">These Workers do not have matching GSV management tags. They may be a legacy install or a name collision, so verify them in Cloudflare before updating. Deletion is disabled here; any older assembler Worker may still need manual removal.</p>`}
-</li>`,
+</article>`,
     )
     .join("");
 
-  const count = installations.length === 1 ? "One GSV install" : `${installations.length} GSV installs`;
   return `<p class="eyebrow"><a href="/logout">Log out</a></p>
-<h1 class="page-title title-row">${cloudflareMark()} Your GSVs</h1>
-<p class="prose">${count} detected in your Cloudflare accounts. Pick one to update, delete a verified install, or deploy a new GSV.</p>
-<section class="section">
-  <ul class="manage-list">${cards}</ul>
+<h1 class="page-title title-row">${cloudflareMark()} Manage your existing GSVs</h1>
+<section class="section manage-section">
+  ${installations.length > 0 ? `<p class="prose">Update an installation or remove one whose ownership GSV can verify.</p><div class="manage-grid">${cards}</div>` : `<div class="empty-state"><strong>No GSVs found</strong><p>There aren't any GSV installations in your connected Cloudflare accounts yet.</p></div>`}
 </section>
-<div class="actions left">
+<section class="section new-gsv-panel">
+  <div>
+    <h2>Want to deploy a new one?</h2>
+    <p>Choose a Cloudflare account and the installer will set up the complete GSV stack.</p>
+  </div>
   <a class="button" href="/deploy">Deploy a new GSV</a>
-</div>`;
+</section>`;
 }
 
 export function confirmDeletePage(install: ExistingGsvInstallation): string {
-  const scripts = install.scriptNames.length > 0 ? install.scriptNames : install.components.map((c) => componentName(c));
+  const scripts = install.scriptNames;
   const bucketName = storageBucketNameForInstance(install.instance);
   return `<p class="eyebrow"><a href="/manage">Your GSVs</a> / <a href="/logout">Log out</a></p>
 <h1 class="page-title title-row">${cloudflareMark()} Delete ${escapeHtml(install.instance)}</h1>
-<p class="prose">This removes the Worker scripts for <strong>${escapeHtml(install.instance)}</strong> in <strong>${escapeHtml(install.accountName)}</strong>. By default your R2 storage bucket and its data are left untouched, so you can redeploy later without losing files.</p>
+<p class="prose">Remove <strong>${escapeHtml(install.instance)}</strong> from <strong>${escapeHtml(install.accountName)}</strong>. Your files stay in R2 by default, so you can redeploy later without losing them.</p>
 <section class="section danger-zone">
-  <h2>Workers to remove</h2>
-  <ul class="lean-list script-list">${scripts.map((name) => `<li><code>${escapeHtml(name)}</code></li>`).join("")}</ul>
+  <div class="delete-outcomes">
+    <div><span class="outcome-label remove">Will be removed</span><strong>GSV and its connected services</strong><p>The Cloudflare Workers that run this installation.</p></div>
+    <div><span class="outcome-label keep">Will be kept</span><strong>Your files and storage</strong><p>The R2 bucket <code>${escapeHtml(bucketName)}</code> and anything stored in it.</p></div>
+  </div>
   <form method="post" action="/manage/delete">
     <input type="hidden" name="accountId" value="${escapeHtml(install.accountId)}">
     <input type="hidden" name="instance" value="${escapeHtml(install.instance)}">
     <label class="check-row danger-check">
       <input type="checkbox" name="deleteStorage" value="1">
       <span>
-        <strong>Also delete storage</strong>
-        <span class="hint">Permanently deletes the R2 bucket <code>${escapeHtml(bucketName)}</code> and all files in it. This can't be undone. The bucket must be empty of objects for Cloudflare to remove it.</span>
+        <strong>Also remove the storage bucket if it is empty</strong>
+        <span class="hint">Cloudflare only removes an empty R2 bucket. This does not delete files; if the bucket contains anything, it will be kept.</span>
       </span>
     </label>
+    <details class="technical-details">
+      <summary>Technical details</summary>
+      <p class="hint">Worker IDs that this installer will remove:</p>
+      <ul class="lean-list script-list">${scripts.map((name) => `<li><code>${escapeHtml(name)}</code></li>`).join("")}</ul>
+    </details>
     <div class="actions left">
       <button class="button danger" type="submit">Delete ${escapeHtml(install.instance)}</button>
       <a class="link-button" href="/manage">Cancel</a>
@@ -282,7 +269,6 @@ ${help}
   <ul class="lean-list">
     <li><strong>Account</strong><span class="detail">${escapeHtml(job.options.accountName || job.options.accountId)}</span></li>
     <li><strong>Release</strong><span class="detail">${escapeHtml(job.result?.version || job.options.version)}</span></li>
-    <li><strong>Components</strong><span class="detail">${escapeHtml(formatComponents(job.options.components))}</span></li>
   </ul>
 </section>
 ${gateway}
@@ -302,17 +288,12 @@ function retryDeployHref(job: DeployJob): string {
     accountId: job.options.accountId,
     instance: job.options.instance,
     version: job.options.version,
-    components: job.options.components.join(","),
   });
   return `/deploy?${params.toString()}`;
 }
 
 function failureHelp(job: DeployJob): string {
   const help = getDeployHelp(job.error ?? "");
-  const hasChannels = job.options.components.some((component) => component.startsWith("channel-"));
-  const tokenNote = hasChannels
-    ? `<p class="hint token-note">You'll re-enter any Discord or Telegram bot tokens on the retry, since they aren't stored.</p>`
-    : "";
   const report =
     help.bucket === "bug"
       ? `<p class="hint help-report">Still stuck? <a href="${HELP_DISCORD_URL}">Ask on Discord</a> and include the deployment ID <code>${escapeHtml(job.id)}</code>.</p>`
@@ -323,7 +304,6 @@ function failureHelp(job: DeployJob): string {
   <div class="actions left">
     <a class="button" href="${escapeHtml(retryDeployHref(job))}">Retry deployment</a>
   </div>
-  ${tokenNote}
   ${report}
 </section>`;
 }
@@ -633,78 +613,6 @@ function renderReleaseOptions(releases: ReleaseOption[], selected?: string): str
     .join("");
 }
 
-function componentControl(component: string, checked: boolean): string {
-  const token = channelTokenField(component);
-  return `<div class="component-card">
-  <label class="check-row"><input type="checkbox" name="component" value="${component}"${checked ? " checked" : ""}><span><strong>${escapeHtml(componentName(component))}</strong><span class="hint">${escapeHtml(componentHint(component))}</span></span></label>
-  ${token}
-</div>`;
-}
-
-function channelTokenField(component: string): string {
-  if (component === "channel-discord") {
-    return `<details class="component-options">
-  <summary>Discord bot token</summary>
-  <label>
-    Bot token
-    <input name="discordBotToken" type="password" autocomplete="off">
-    <span class="hint">Optional. You can also configure Discord later in GSV.</span>
-  </label>
-</details>`;
-  }
-  if (component === "channel-telegram") {
-    return `<details class="component-options">
-  <summary>Telegram bot token</summary>
-  <label>
-    Bot token
-    <input name="telegramBotToken" type="password" autocomplete="off">
-    <span class="hint">Optional. You can also configure Telegram later in GSV.</span>
-  </label>
-</details>`;
-  }
-  return "";
-}
-
-function componentName(component: string): string {
-  switch (component) {
-    case "ripgit":
-      return "Storage";
-    case "assembler":
-      return "Legacy package builder";
-    case "gateway":
-      return "Core GSV";
-    case "channel-whatsapp":
-      return "WhatsApp channel";
-    case "channel-discord":
-      return "Discord channel";
-    case "channel-telegram":
-      return "Telegram channel";
-    default:
-      return component;
-  }
-}
-
-function componentHint(component: string): string {
-  switch (component) {
-    case "ripgit":
-      return "Home files, Wiki, package source, artifacts, and process state.";
-    case "gateway":
-      return "Desktop, users, agents, files, settings, and setup.";
-    case "channel-whatsapp":
-      return "Optional WhatsApp message adapter.";
-    case "channel-discord":
-      return "Optional Discord message adapter.";
-    case "channel-telegram":
-      return "Optional Telegram message adapter.";
-    default:
-      return "";
-  }
-}
-
-function formatComponents(components: string[]): string {
-  return components.map(componentName).join(", ");
-}
-
 function renderSteps(job: DeployJob): string {
   return job.steps
     .map((step) => {
@@ -763,7 +671,7 @@ function progressSummary(job: DeployJob): {
           tone: "success",
           label: "Complete",
           title: "GSV is ready",
-          message: job.result?.gatewayUrl ? "Go to your GSV to create your first user." : "The selected components are deployed.",
+          message: job.result?.gatewayUrl ? "Go to your GSV to create your first user." : "GSV services are deployed.",
         };
   }
 

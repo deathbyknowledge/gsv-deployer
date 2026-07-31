@@ -42,9 +42,9 @@ const HELP_CATALOG: Record<DeployHelpCategory, Omit<DeployHelp, "category">> = {
     whatToDo: "Use only lowercase letters, numbers, and dashes for the install name, then Retry.",
   },
   "no-components": {
-    bucket: "self-fixable",
-    detail: "Choose at least one valid GSV component and try the deployment again.",
-    whatToDo: "Select at least one component on the deploy form, then Retry.",
+    bucket: "bug",
+    detail: "The deployment did not contain a valid GSV stack.",
+    whatToDo: "Retry with Latest stable. If it happens again, report the deployment ID so we can inspect the release.",
   },
   "auth-rejected": {
     bucket: "self-fixable",
@@ -82,7 +82,7 @@ const HELP_CATALOG: Record<DeployHelpCategory, Omit<DeployHelp, "category">> = {
   "gateway-dependency": {
     bucket: "self-fixable",
     detail: "The selected gateway release is missing a required storage or legacy assembly Worker.",
-    whatToDo: "Keep Storage selected and Retry. Legacy releases include their package-builder Worker automatically when it is available in the release.",
+    whatToDo: "Retry with Latest stable or choose another release. Legacy releases include their package-builder Worker automatically; there is nothing to select manually.",
   },
   unknown: {
     bucket: "bug",

@@ -3,7 +3,8 @@ import { Hono, type Context } from "hono";
 export { GsvDeployWorkflow } from "./workflow";
 export { DeployJobState } from "./deploy-job";
 
-import { ALL_COMPONENTS, deleteGsvInstallation, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
+import { completeDeployOptions, deleteGsvInstallation, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
+import type { ExistingGsvInstallation } from "./deploy";
 import departureMonoWoff2 from "./assets/departure-mono.woff2";
 import { ANALYTICS_SCRIPT } from "./analytics";
 import {
@@ -32,9 +33,31 @@ import {
   trackRequestEvent,
 } from "./metrics";
 import { fetchDailyHistory, fetchDeployTotals, fetchInstallList, rollupHistory } from "./history";
-import type { AppEnv, DeployAdapterSecrets, DeployJob, DeployOptions } from "./types";
+import type { Account, AppEnv, DeployJob, DeployOptions } from "./types";
 
 const app = new Hono<AppEnv>();
+const PREVIEW_ACCOUNTS: Account[] = [
+  { id: "acc1", name: "My Cloudflare" },
+  { id: "acc2", name: "Other account" },
+];
+const PREVIEW_INSTALLATIONS: ExistingGsvInstallation[] = [
+  {
+    accountId: "acc1",
+    accountName: "My Cloudflare",
+    instance: "gsv",
+    components: ["gateway", "ripgit", "assembler"],
+    scriptNames: [],
+    deleteSupported: false,
+  },
+  {
+    accountId: "acc2",
+    accountName: "Other account",
+    instance: "gsv-work",
+    components: ["gateway", "ripgit", "channel-discord"],
+    scriptNames: ["gsv-work", "gsv-work-ripgit", "gsv-work-channel-discord"],
+    deleteSupported: true,
+  },
+];
 
 app.use("*", async (c, next) => {
   await next();
@@ -215,35 +238,22 @@ app.post("/deploy", async (c) => {
     });
   }
 
-  const components = form.getAll("component").map(String).filter((value) => ALL_COMPONENTS.includes(value as (typeof ALL_COMPONENTS)[number]));
-  if (existingTarget && components.length === 0) {
-    return page(c, {
-      title: "No components selected",
-      body: errorPage(
-        "No components selected",
-        "Select at least one component to deploy or refresh. Existing components left unchecked stay deployed.",
-      ),
-      status: 400,
-    });
-  }
-  const options: DeployOptions = {
+  // Components are an internal release detail, not a product choice. Always
+  // request the complete current stack; release resolution adds assembler only
+  // for legacy releases that actually publish it.
+  const options: DeployOptions = completeDeployOptions({
     accountId,
     accountName: account.name,
     instance: (existingTarget?.instance ?? stringField(form, "instance")) || "gsv",
     version: stringField(form, "version") || "latest",
-    components: components.length > 0 ? components : [...ALL_COMPONENTS],
-  };
-  const adapterSecrets: DeployAdapterSecrets = {
-    discordBotToken: optionalStringField(form, "discordBotToken"),
-    telegramBotToken: optionalStringField(form, "telegramBotToken"),
-  };
+  });
 
   const { job, viewToken } = await createJob(c.env, {
     sessionId: current.sessionId,
     options,
     token: current.session.token,
     tokenIssuedAt: sessionCreatedAtMs(current.session.createdAt),
-    adapterSecrets,
+    adapterSecrets: {},
   });
   trackRequestEvent(
     c.env,
@@ -434,20 +444,10 @@ app.get("/health", (c) => c.json({ ok: true }));
 // Auth-free page previews for local review. Enabled only when ENVIRONMENT is
 // "development" (set by the `dev` npm script); returns 404 in production.
 app.get("/preview/:kind", (c) => {
-  if (c.env.ENVIRONMENT !== "development") {
-    return page(c, {
-      title: "Not Found",
-      body: errorPage("Not Found", "That route does not exist."),
-      status: 404,
-    });
-  }
+  if (c.env.ENVIRONMENT !== "development") return previewNotFound(c);
   const kind = c.req.param("kind");
-  const previewInstalls = [
-    { accountId: "acc1", accountName: "My Cloudflare", instance: "gsv", components: ["gateway", "ripgit", "assembler"], scriptNames: [], deleteSupported: false },
-    { accountId: "acc2", accountName: "Other account", instance: "gsv-work", components: ["gateway", "ripgit", "assembler", "channel-discord"], scriptNames: [], deleteSupported: true },
-  ];
   if (kind === "manage") {
-    return page(c, { title: "Your GSVs", body: managePage(previewInstalls), width: "wide" });
+    return page(c, { title: "Your GSVs", body: managePage(PREVIEW_INSTALLATIONS), width: "wide" });
   }
   if (kind === "manage-empty") {
     return page(c, { title: "Your GSVs", body: managePage([]), width: "wide" });
@@ -459,8 +459,8 @@ app.get("/preview/:kind", (c) => {
         accountId: "acc2",
         accountName: "Other account",
         instance: "gsv-work",
-        components: ["gateway", "ripgit", "assembler", "channel-discord"],
-        scriptNames: ["gsv-work", "gsv-work-ripgit", "gsv-work-assembler", "gsv-work-channel-discord"],
+        components: ["gateway", "ripgit", "channel-discord"],
+        scriptNames: ["gsv-work", "gsv-work-ripgit", "gsv-work-channel-discord"],
         deleteSupported: true,
       }),
       width: "wide",
@@ -470,14 +470,11 @@ app.get("/preview/:kind", (c) => {
     return page(c, {
       title: "Deploy GSV",
       body: deployPage(
-        [
-          { id: "acc1", name: "My Cloudflare" },
-          { id: "acc2", name: "Other account" },
-        ] as unknown as Parameters<typeof deployPage>[0],
+        PREVIEW_ACCOUNTS,
         c.env.OAUTH_SCOPES,
         [],
-        previewInstalls,
-        { mode: "update", accountId: "acc2", instance: "gsv-work", components: ["gateway", "ripgit", "assembler", "channel-discord"] },
+        PREVIEW_INSTALLATIONS,
+        { mode: "update", accountId: "acc2", instance: "gsv-work" },
       ),
       width: "wide",
     });
@@ -486,18 +483,16 @@ app.get("/preview/:kind", (c) => {
     return page(c, {
       title: "Deploy GSV",
       body: deployPage(
-        [
-          { id: "acc1", name: "My Cloudflare" },
-          { id: "acc2", name: "Other account" },
-        ] as unknown as Parameters<typeof deployPage>[0],
+        PREVIEW_ACCOUNTS,
         c.env.OAUTH_SCOPES,
         [],
         [],
-        { accountId: "acc2", instance: "gsv-personal", version: "latest", components: ["gateway", "ripgit"] },
+        { mode: "retry", accountId: "acc2", instance: "gsv-personal", version: "latest" },
       ),
       width: "wide",
     });
   }
+  if (kind !== "success" && kind !== "error" && kind !== "selffix") return previewNotFound(c);
   const now = Date.now();
   if (kind === "success") {
     const successJob: DeployJob = {
@@ -511,12 +506,12 @@ app.get("/preview/:kind", (c) => {
         accountName: "My Cloudflare",
         instance: "gsv",
         version: "latest",
-        components: ["gateway", "ripgit", "assembler", "channel-discord"],
+        components: ["gateway", "ripgit", "channel-discord"],
       },
       steps: [
         { id: "authorize", title: "Authorize Cloudflare", description: "Confirm access.", status: "complete", detail: "Authorized My Cloudflare." },
         { id: "release", title: "Choose GSV release", description: "Find the release.", status: "complete" },
-        { id: "prepare", title: "Prepare components", description: "Download and verify.", status: "complete" },
+        { id: "prepare", title: "Prepare GSV", description: "Download and verify.", status: "complete" },
         { id: "storage", title: "Create storage", description: "Set up storage resources.", status: "complete" },
         { id: "workers", title: "Deploy Workers", description: "Upload Workers.", status: "complete" },
         { id: "bindings", title: "Connect services", description: "Wire Workers together.", status: "complete" },
@@ -548,14 +543,14 @@ app.get("/preview/:kind", (c) => {
     steps: [
       { id: "authorize", title: "Authorize Cloudflare", description: "Confirm access.", status: "complete", detail: "Authorized My Cloudflare." },
       { id: "release", title: "Choose GSV release", description: "Find the release.", status: "complete" },
-      { id: "prepare", title: "Prepare components", description: "Download and verify.", status: "complete" },
+      { id: "prepare", title: "Prepare GSV", description: "Download and verify.", status: "complete" },
       { id: "storage", title: "Create storage", description: "Set up storage resources.", status: "failed" },
       { id: "workers", title: "Deploy Workers", description: "Upload Workers.", status: "pending" },
       { id: "finish", title: "Finish setup", description: "Confirm result.", status: "pending" },
     ],
     logs: [
       { at: now, level: "info", message: "Queued deployment." },
-      { at: now, level: "info", message: "Prepared components." },
+      { at: now, level: "info", message: "Prepared GSV release." },
       { at: now, level: "error", message: error },
     ],
     error,
@@ -621,26 +616,14 @@ function stringField(form: FormData, name: string): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function optionalStringField(form: FormData, name: string): string | undefined {
-  const value = stringField(form, name);
-  return value || undefined;
-}
-
 function parseDeployPrefill(query: Record<string, string>): DeployPrefill | undefined {
   const mode = query.update === "1" ? "update" : query.retry === "1" ? "retry" : undefined;
   if (!mode) return undefined;
-  const components = query.components
-    ? query.components
-        .split(",")
-        .map((value) => value.trim())
-        .filter((value) => ALL_COMPONENTS.includes(value as (typeof ALL_COMPONENTS)[number]))
-    : undefined;
   return {
     mode,
     accountId: query.accountId || undefined,
     instance: query.instance || undefined,
     version: query.version || undefined,
-    components: components && components.length > 0 ? components : undefined,
   };
 }
 
@@ -670,6 +653,14 @@ function redirectWithCookies(location: string, cookies: string[]): Response {
   const headers = new Headers({ Location: location });
   for (const cookie of cookies) headers.append("Set-Cookie", cookie);
   return new Response(null, { status: 302, headers });
+}
+
+function previewNotFound(c: Context<AppEnv>): Response {
+  return page(c, {
+    title: "Not Found",
+    body: errorPage("Not Found", "That route does not exist."),
+    status: 404,
+  });
 }
 
 function redirectToLogin(c: Context<AppEnv>): Response {

@@ -59,6 +59,10 @@ export const ALL_COMPONENTS = [
   COMPONENT_CHANNEL_TELEGRAM,
 ] as const;
 
+export function completeDeployOptions(options: Omit<DeployOptions, "components">): DeployOptions {
+  return { ...options, components: [...ALL_COMPONENTS] };
+}
+
 const COMPONENT_TO_BUNDLE: Record<string, string> = {
   [LEGACY_COMPONENT_ASSEMBLER]: "gsv-cloudflare-assembler.tar.gz",
   [COMPONENT_GATEWAY]: "gsv-cloudflare-gateway.tar.gz",
@@ -351,7 +355,7 @@ export type DeleteInstallationResult = {
 };
 
 export type DeleteInstallationOptions = {
-  /** When true, also delete the install's R2 storage bucket and its data. */
+  /** When true, also remove the install's R2 storage bucket if it is empty. */
   deleteStorage?: boolean;
 };
 
@@ -366,7 +370,8 @@ export function storageBucketNameForInstance(instance: string): string {
  *
  * By default the R2 storage bucket and its data are left untouched so the
  * install can be redeployed later without losing files. Pass `deleteStorage` to
- * also delete the bucket (which permanently erases its contents).
+ * also remove the bucket when it is already empty; Cloudflare rejects deletion
+ * for buckets that still contain objects.
  */
 export async function deleteGsvInstallation(
   accessToken: string,
@@ -604,7 +609,7 @@ async function prepareDeploymentPlan(
   await logger.step("release", "complete", `Using ${version}.`);
   await logger.info(`Preparing ${requestedComponents.join(", ")} from ${version}.`);
 
-  await logger.step("prepare", "running", "Downloading and verifying the selected release components.");
+  await logger.step("prepare", "running", "Downloading and verifying the selected GSV release.");
   const artifactCachePrefix = deploymentArtifactCachePrefix(jobId);
   const prepared = await prepareBundles(env, repoOwner, repoName, version, requestedComponents, instance, logger, {
     kind: "release",
@@ -612,7 +617,7 @@ async function prepareDeploymentPlan(
   });
   const components = prepared.map((bundle) => bundle.component);
   if (components.length === 0) throw new Error(`None of the selected components are available in ${version}.`);
-  await logger.step("prepare", "complete", "GSV components are verified and ready.");
+  await logger.step("prepare", "complete", "The GSV release is verified and ready.");
 
   return { repoOwner, repoName, version, instance, components, artifactCachePrefix };
 }
@@ -748,7 +753,7 @@ async function configureAdaptersAndFinish(
   if (hasChannelComponents) {
     await logger.step("adapters", "running", "Applying channel configuration.");
   }
-  const adapterNotes: string[] = [];
+  let configuredChannels = 0;
   if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD) && adapterSecrets.discordBotToken) {
     await setWorkerSecret(
       accessToken,
@@ -758,8 +763,7 @@ async function configureAdaptersAndFinish(
       adapterSecrets.discordBotToken,
     );
     await logger.info("Configured DISCORD_BOT_TOKEN.");
-  } else if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD)) {
-    adapterNotes.push("Discord needs a bot token before it can receive messages.");
+    configuredChannels += 1;
   }
 
   if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && adapterSecrets.telegramBotToken) {
@@ -771,17 +775,15 @@ async function configureAdaptersAndFinish(
       adapterSecrets.telegramBotToken,
     );
     await logger.info("Configured TELEGRAM_BOT_TOKEN.");
-  } else if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM)) {
-    adapterNotes.push("Telegram needs a bot token before it can receive messages.");
-  }
-  if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && !accountSubdomain) {
-    adapterNotes.push("Telegram webhook URL could not be set because the workers.dev subdomain was unavailable.");
+    configuredChannels += 1;
   }
   if (hasChannelComponents) {
     await logger.step(
       "adapters",
-      adapterNotes.length > 0 ? "warning" : "complete",
-      adapterNotes.length > 0 ? adapterNotes.join(" ") : "Channel settings are ready.",
+      "complete",
+      configuredChannels > 0
+        ? "Provided channel credentials are configured. Other channels can be connected later in GSV."
+        : "Messaging channels are installed and can be connected later in GSV.",
     );
   }
 
@@ -798,7 +800,7 @@ async function configureAdaptersAndFinish(
       ? "GSV is ready for browser setup."
       : selectedComponents.has(COMPONENT_GATEWAY)
         ? "GSV deployed, but the workers.dev setup URL was unavailable. Open the gateway Worker from the Cloudflare dashboard."
-        : "Selected components are deployed.",
+        : "GSV services are deployed.",
   );
 
   return { version: plan.version, gatewayUrl };

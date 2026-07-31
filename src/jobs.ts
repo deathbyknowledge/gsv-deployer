@@ -343,8 +343,8 @@ function createDeploySteps(options: DeployOptions, now: number): DeployStep[] {
     },
     {
       id: "prepare",
-      title: "Prepare components",
-      description: "Download and verify the selected GSV components.",
+      title: "Prepare GSV",
+      description: "Download and verify the selected GSV release.",
       status: "pending",
     },
     {
@@ -371,7 +371,7 @@ function createDeploySteps(options: DeployOptions, now: number): DeployStep[] {
     steps.push({
       id: "adapters",
       title: "Configure channels",
-      description: "Apply channel settings and optional bot tokens.",
+      description: "Prepare messaging channels for setup in GSV.",
       status: "pending",
     });
   }

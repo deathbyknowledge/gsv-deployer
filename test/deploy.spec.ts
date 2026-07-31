@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ALL_COMPONENTS,
   buildUploadMetadata,
+  completeDeployOptions,
   deleteGsvInstallation,
   detectGsvInstallations,
   resolveReleaseComponents,
@@ -19,6 +20,11 @@ describe("deployment compatibility", () => {
 
   it("deploys only current GSV components", () => {
     expect(ALL_COMPONENTS).not.toContain("assembler");
+    expect(completeDeployOptions({
+      accountId: "account-id",
+      instance: "gsv",
+      version: "latest",
+    }).components).toEqual(ALL_COMPONENTS);
   });
 
   it("derives legacy assembler compatibility from the release checksums", () => {
