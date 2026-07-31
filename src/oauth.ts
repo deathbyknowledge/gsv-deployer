@@ -12,7 +12,8 @@ export type TokenAuthMethod = "client_secret_post" | "client_secret_basic";
 
 export async function startLogin(c: Context<AppEnv>): Promise<Response> {
   const state = randomToken();
-  await c.env.SESSIONS.put(`oauth-state:${state}`, "1", {
+  const returnTo = safeOAuthReturnPath(c.req.query("returnTo"));
+  await c.env.SESSIONS.put(`oauth-state:${state}`, returnTo, {
     expirationTtl: STATE_TTL_SECONDS,
   });
 
@@ -66,10 +67,31 @@ export async function handleCallback(c: Context<AppEnv>): Promise<Response> {
   });
 
   const cookieValue = await signSessionId(c.env.SESSION_SECRET, sessionId);
-  return redirectWithCookies("/deploy", [
+  return redirectWithCookies(safeOAuthReturnPath(storedState), [
     clearCookie(STATE_COOKIE),
     setCookie(SESSION_COOKIE, cookieValue, SESSION_TTL_SECONDS),
   ]);
+}
+
+export function safeOAuthReturnPath(value: string | null | undefined): string {
+  const fallback = "/manage";
+  const raw = value?.trim();
+  if (!raw || raw.length > 2_048 || !raw.startsWith("/") || raw.startsWith("//")) return fallback;
+
+  try {
+    const base = new URL("https://gsv-deployment.invalid");
+    const parsed = new URL(raw, base);
+    if (parsed.origin !== base.origin || parsed.hash) return fallback;
+
+    const allowed =
+      parsed.pathname === "/manage" ||
+      parsed.pathname === "/manage/delete" ||
+      parsed.pathname === "/deploy" ||
+      parsed.pathname.startsWith("/jobs/");
+    return allowed ? `${parsed.pathname}${parsed.search}` : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export async function getSessionWithId(

@@ -4,6 +4,7 @@ import { parse as parseJsonc } from "jsonc-parser";
 import { ungzip } from "pako";
 import { parse as parseToml } from "smol-toml";
 
+import { getDeployHelp } from "./deploy-help";
 import { deleteDeployCredentials, DeployJobWriter, getDeployCredentials } from "./jobs";
 import { trackEvent } from "./metrics";
 import type {
@@ -17,7 +18,7 @@ import type {
 
 const COMPONENT_GATEWAY = "gateway";
 const COMPONENT_RIPGIT = "ripgit";
-const COMPONENT_ASSEMBLER = "assembler";
+const LEGACY_COMPONENT_ASSEMBLER = "assembler";
 const COMPONENT_CHANNEL_WHATSAPP = "channel-whatsapp";
 const COMPONENT_CHANNEL_DISCORD = "channel-discord";
 const COMPONENT_CHANNEL_TELEGRAM = "channel-telegram";
@@ -26,13 +27,19 @@ const BUNDLE_CHECKSUMS = "cloudflare-checksums.txt";
 const DEFAULT_DEPLOY_INSTANCE = "gsv";
 const DEFAULT_STORAGE_BUCKET_NAME = "gsv-storage";
 const SCRIPT_GATEWAY = "gsv";
-const SCRIPT_ASSEMBLER = "gsv-assembler";
 const SCRIPT_RIPGIT = "ripgit";
+const LEGACY_SCRIPT_ASSEMBLER = "gsv-assembler";
 const SCRIPT_CHANNEL_WHATSAPP = "gsv-channel-whatsapp";
 const SCRIPT_CHANNEL_DISCORD = "gsv-channel-discord";
 const SCRIPT_CHANNEL_TELEGRAM = "gsv-channel-telegram";
+const RIPGIT_PAID_CPU_LIMIT_MS = 300_000;
+const WORKER_TAG_MANAGED = "gsv-managed-v1";
+const WORKER_TAG_INSTANCE_PREFIX = "gsv-instance-";
+const WORKER_TAG_COMPONENT_PREFIX = "gsv-component-";
 const WORKERS_SUBDOMAIN_API_DATE = "2025-08-01";
 const MAX_SOURCE_MAP_UPLOAD_BYTES = 2 * 1024 * 1024;
+const R2_DELETE_BATCH_SIZE = 32;
+const R2_DELETE_CONCURRENCY = 6;
 const DEPLOY_WORKFLOW_STEP_CONFIG = {
   timeout: "30 minutes",
   retries: { limit: 2, delay: "30 seconds", backoff: "linear" },
@@ -48,15 +55,18 @@ const CLEANUP_WORKFLOW_STEP_CONFIG = {
 
 export const ALL_COMPONENTS = [
   COMPONENT_RIPGIT,
-  COMPONENT_ASSEMBLER,
   COMPONENT_GATEWAY,
   COMPONENT_CHANNEL_WHATSAPP,
   COMPONENT_CHANNEL_DISCORD,
   COMPONENT_CHANNEL_TELEGRAM,
 ] as const;
 
+export function completeDeployOptions(options: Omit<DeployOptions, "components">): DeployOptions {
+  return { ...options, components: [...ALL_COMPONENTS] };
+}
+
 const COMPONENT_TO_BUNDLE: Record<string, string> = {
-  [COMPONENT_ASSEMBLER]: "gsv-cloudflare-assembler.tar.gz",
+  [LEGACY_COMPONENT_ASSEMBLER]: "gsv-cloudflare-assembler.tar.gz",
   [COMPONENT_GATEWAY]: "gsv-cloudflare-gateway.tar.gz",
   [COMPONENT_RIPGIT]: "gsv-cloudflare-ripgit.tar.gz",
   [COMPONENT_CHANNEL_WHATSAPP]: "gsv-cloudflare-channel-whatsapp.tar.gz",
@@ -84,6 +94,7 @@ export type ExistingGsvInstallation = {
   instance: string;
   components: string[];
   scriptNames: string[];
+  deleteSupported: boolean;
 };
 
 type BundleManifest = {
@@ -182,6 +193,20 @@ type CloudflareApiResponse<T> = {
 type WorkerScriptSummary = {
   id: string;
   migration_tag?: string | null;
+  tags?: string[] | null;
+};
+
+type WorkerScriptDetails = {
+  migrationTag: string | null;
+  tags: string[];
+};
+
+type CloudflareSubscription = {
+  rate_plan?: {
+    id?: string;
+    scope?: string;
+  };
+  state?: string;
 };
 
 type AssetsUploadSessionResponse = {
@@ -213,6 +238,7 @@ type DeploymentPlan = {
 
 type DeploymentPreflight = {
   accountSubdomain: string | null;
+  workersPaid: boolean;
 };
 
 type DeploymentResult = {
@@ -308,7 +334,12 @@ export async function findExistingGsvInstallations(
   for (const account of accounts) {
     try {
       const scripts = await listWorkerScripts(accessToken, account.id);
-      installations.push(...detectGsvInstallations(account, [...scripts.keys()]));
+      installations.push(
+        ...detectGsvInstallations(
+          account,
+          [...scripts].map(([id, details]) => ({ id, tags: details.tags })),
+        ),
+      );
     } catch {
       // Account inspection is opportunistic. The deploy form should still render.
     }
@@ -317,6 +348,165 @@ export async function findExistingGsvInstallations(
     const account = a.accountName.localeCompare(b.accountName);
     return account || a.instance.localeCompare(b.instance);
   });
+}
+
+export type DeleteWorkersResult = {
+  deleted: string[];
+  failed: Array<{ script: string; error: string }>;
+};
+
+export type DeleteR2ObjectsBatchResult = {
+  bucketMissing: boolean;
+  deleted: number;
+  empty: boolean;
+};
+
+export function storageBucketNameForInstance(instance: string): string {
+  return instance === DEFAULT_DEPLOY_INSTANCE ? DEFAULT_STORAGE_BUCKET_NAME : `${instance}-storage`;
+}
+
+/**
+ * Removes the Worker scripts that make up a verified GSV install. `force=true`
+ * is intentional: deleting a GSV also deletes the Durable Object namespaces and
+ * runtime data owned by those scripts. R2 cleanup happens only after this phase
+ * succeeds, so a partial Worker failure cannot erase the installation's files.
+ */
+export async function deleteGsvWorkers(
+  accessToken: string,
+  installation: ExistingGsvInstallation,
+): Promise<DeleteWorkersResult> {
+  if (!installation.deleteSupported) {
+    return refusedDeletionResult(
+      installation,
+      "Worker ownership could not be verified from GSV management tags.",
+    );
+  }
+
+  let currentScripts: Map<string, WorkerScriptDetails>;
+  try {
+    currentScripts = await listWorkerScripts(accessToken, installation.accountId);
+  } catch (error) {
+    return refusedDeletionResult(
+      installation,
+      `Worker ownership could not be reverified: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const unsafeScripts = installation.scriptNames.filter((scriptName) => {
+    const details = currentScripts.get(scriptName);
+    if (!details) return false;
+    const component = componentForInstallationScriptName(installation.instance, scriptName);
+    return !component || !hasExpectedWorkerTags(details.tags, installation.instance, component);
+  });
+  if (unsafeScripts.length > 0) {
+    return {
+      deleted: [],
+      failed: unsafeScripts.map((script) => ({
+        script,
+        error: "Worker ownership changed or could not be verified from GSV management tags.",
+      })),
+    };
+  }
+
+  const deleted: string[] = [];
+  const failed: Array<{ script: string; error: string }> = [];
+  // Delete the gateway (and other dependents) before their dependencies.
+  const ordered = [...installation.scriptNames].sort((a, b) => deleteOrder(b) - deleteOrder(a));
+  for (const scriptName of ordered) {
+    try {
+      await deleteWorkerScript(accessToken, installation.accountId, scriptName);
+      deleted.push(scriptName);
+    } catch (error) {
+      failed.push({ script: scriptName, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  return { deleted, failed };
+}
+
+function refusedDeletionResult(
+  installation: ExistingGsvInstallation,
+  error: string,
+): DeleteWorkersResult {
+  const scripts = installation.scriptNames.length > 0 ? installation.scriptNames : [installation.instance];
+  return {
+    deleted: [],
+    failed: scripts.map((script) => ({ script, error })),
+  };
+}
+
+export async function deleteR2ObjectsBatch(
+  accessToken: string,
+  accountId: string,
+  bucketName: string,
+): Promise<DeleteR2ObjectsBatchResult> {
+  const response = await cloudflareRaw(
+    accessToken,
+    `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}/objects?per_page=${R2_DELETE_BATCH_SIZE}`,
+  );
+  if (response.status === 404) return { bucketMissing: true, deleted: 0, empty: true };
+
+  const objects = await parseCloudflareEnvelope<Array<{ key?: string }>>(response, `List R2 objects in ${bucketName}`);
+  const keys = objects.map((object) => object.key);
+  if (keys.some((key) => typeof key !== "string")) {
+    throw new Error(`List R2 objects in ${bucketName} returned an object without a key.`);
+  }
+  const objectKeys = keys as string[];
+  for (let index = 0; index < objectKeys.length; index += R2_DELETE_CONCURRENCY) {
+    await Promise.all(
+      objectKeys
+        .slice(index, index + R2_DELETE_CONCURRENCY)
+        .map((key) => deleteR2Object(accessToken, accountId, bucketName, key)),
+    );
+  }
+  return { bucketMissing: false, deleted: objectKeys.length, empty: objectKeys.length === 0 };
+}
+
+export async function deleteR2Bucket(accessToken: string, accountId: string, bucketName: string): Promise<void> {
+  const response = await cloudflareRaw(
+    accessToken,
+    `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}`,
+    { method: "DELETE" },
+  );
+  // A bucket that is already gone is a success from the caller's perspective.
+  if (response.status === 404) return;
+  await parseCloudflareEnvelope(response, `Delete R2 bucket ${bucketName}`);
+}
+
+async function deleteR2Object(
+  accessToken: string,
+  accountId: string,
+  bucketName: string,
+  objectKey: string,
+): Promise<void> {
+  const response = await cloudflareRaw(
+    accessToken,
+    `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}/objects/${encodeR2ObjectKey(objectKey)}`,
+    { method: "DELETE" },
+  );
+  if (response.status === 404) return;
+  await parseCloudflareEnvelope(response, `Delete R2 object from ${bucketName}`);
+}
+
+function encodeR2ObjectKey(key: string): string {
+  // Cloudflare's R2 REST API requires path separators in object keys to stay
+  // literal while all other reserved characters remain percent-encoded.
+  return key.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
+async function deleteWorkerScript(accessToken: string, accountId: string, scriptName: string): Promise<void> {
+  const response = await cloudflareRaw(
+    accessToken,
+    `/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}?force=true`,
+    { method: "DELETE" },
+  );
+  // A script that is already gone is a success from the caller's perspective.
+  if (response.status === 404) return;
+  await parseCloudflareEnvelope(response, `Delete script ${scriptName}`);
+}
+
+function deleteOrder(scriptName: string): number {
+  const match = componentForScriptName(scriptName);
+  return match ? deployOrder(match.component) : 100;
 }
 
 export async function runDeployWorkflow(
@@ -444,23 +634,25 @@ async function prepareDeploymentPlan(
   logger: DeployLogger,
 ): Promise<DeploymentPlan> {
   const instance = parseInstance(options.instance);
-  const components = normalizeComponents(options.components).sort((a, b) => deployOrder(a) - deployOrder(b));
-  if (components.length === 0) throw new Error("No components selected.");
+  const requestedComponents = normalizeComponents(options.components).sort((a, b) => deployOrder(a) - deployOrder(b));
+  if (requestedComponents.length === 0) throw new Error("No components selected.");
 
   const repoOwner = env.GSV_REPO_OWNER || "deathbyknowledge";
   const repoName = env.GSV_REPO_NAME || "gsv";
   await logger.step("release", "running", "Looking up the requested GSV release.");
   const version = await resolveReleaseTag(repoOwner, repoName, options.version, logger);
   await logger.step("release", "complete", `Using ${version}.`);
-  await logger.info(`Preparing ${components.join(", ")} from ${version}.`);
+  await logger.info(`Preparing ${requestedComponents.join(", ")} from ${version}.`);
 
-  await logger.step("prepare", "running", `Downloading and verifying ${formatCount(components.length, "component")}.`);
+  await logger.step("prepare", "running", "Downloading and verifying the selected GSV release.");
   const artifactCachePrefix = deploymentArtifactCachePrefix(jobId);
-  await prepareBundles(env, repoOwner, repoName, version, components, instance, logger, {
+  const prepared = await prepareBundles(env, repoOwner, repoName, version, requestedComponents, instance, logger, {
     kind: "release",
     snapshotPrefix: artifactCachePrefix,
   });
-  await logger.step("prepare", "complete", "GSV components are verified and ready.");
+  const components = prepared.map((bundle) => bundle.component);
+  if (components.length === 0) throw new Error(`None of the selected components are available in ${version}.`);
+  await logger.step("prepare", "complete", "The GSV release is verified and ready.");
 
   return { repoOwner, repoName, version, instance, components, artifactCachePrefix };
 }
@@ -473,7 +665,10 @@ async function inspectDeploymentTarget(
   logger: DeployLogger,
 ): Promise<DeploymentPreflight> {
   const selectedComponents = new Set(plan.components);
-  const existingScriptsWithMigrations = await listWorkerScripts(accessToken, accountId);
+  const [existingScriptsWithMigrations, workersPaid] = await Promise.all([
+    listWorkerScripts(accessToken, accountId),
+    resolveWorkersPaid(accessToken, accountId, logger),
+  ]);
   const existingScripts = new Set([...existingScriptsWithMigrations.keys()]);
   assertGatewayDependenciesAvailable(
     selectedComponents,
@@ -487,7 +682,7 @@ async function inspectDeploymentTarget(
   await logger.step("storage", "complete", "Storage resources are ready.");
 
   const accountSubdomain = await fetchAccountWorkersSubdomain(accessToken, accountId, logger);
-  return { accountSubdomain };
+  return { accountSubdomain, workersPaid };
 }
 
 async function deployWorkerScripts(
@@ -520,11 +715,12 @@ async function deployWorkerScripts(
       selectedComponents,
       availableScripts,
       accountSubdomain,
-      existingMigrationTag: existingScriptsWithMigrations.get(bundle.scriptName) ?? null,
+      existingMigrationTag: existingScriptsWithMigrations.get(bundle.scriptName)?.migrationTag ?? null,
       includeMigrations: true,
       scriptExists: existingScriptsWithMigrations.has(bundle.scriptName),
       uploadedAssets,
       keepAssets: false,
+      workersPaid: preflight.workersPaid,
       logger,
     });
     await uploadWorkerScript(accessToken, accountId, bundle, metadata, false);
@@ -567,6 +763,7 @@ async function finalizeWorkerBindings(
       scriptExists: true,
       uploadedAssets: null,
       keepAssets: hasAssets(bundle),
+      workersPaid: preflight.workersPaid,
       logger,
     });
     await uploadWorkerScript(accessToken, accountId, bundle, metadata, true);
@@ -591,7 +788,7 @@ async function configureAdaptersAndFinish(
   if (hasChannelComponents) {
     await logger.step("adapters", "running", "Applying channel configuration.");
   }
-  const adapterNotes: string[] = [];
+  let configuredChannels = 0;
   if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD) && adapterSecrets.discordBotToken) {
     await setWorkerSecret(
       accessToken,
@@ -601,8 +798,7 @@ async function configureAdaptersAndFinish(
       adapterSecrets.discordBotToken,
     );
     await logger.info("Configured DISCORD_BOT_TOKEN.");
-  } else if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD)) {
-    adapterNotes.push("Discord needs a bot token before it can receive messages.");
+    configuredChannels += 1;
   }
 
   if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && adapterSecrets.telegramBotToken) {
@@ -614,17 +810,14 @@ async function configureAdaptersAndFinish(
       adapterSecrets.telegramBotToken,
     );
     await logger.info("Configured TELEGRAM_BOT_TOKEN.");
-  } else if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM)) {
-    adapterNotes.push("Telegram needs a bot token before it can receive messages.");
-  }
-  if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && !accountSubdomain) {
-    adapterNotes.push("Telegram webhook URL could not be set because the workers.dev subdomain was unavailable.");
+    configuredChannels += 1;
   }
   if (hasChannelComponents) {
+    const outcome = adapterConfigurationOutcome([...selectedComponents], accountSubdomain, configuredChannels);
     await logger.step(
       "adapters",
-      adapterNotes.length > 0 ? "warning" : "complete",
-      adapterNotes.length > 0 ? adapterNotes.join(" ") : "Channel settings are ready.",
+      outcome.status,
+      outcome.detail,
     );
   }
 
@@ -641,10 +834,28 @@ async function configureAdaptersAndFinish(
       ? "GSV is ready for browser setup."
       : selectedComponents.has(COMPONENT_GATEWAY)
         ? "GSV deployed, but the workers.dev setup URL was unavailable. Open the gateway Worker from the Cloudflare dashboard."
-        : "Selected components are deployed.",
+        : "GSV services are deployed.",
   );
 
   return { version: plan.version, gatewayUrl };
+}
+
+export function adapterConfigurationOutcome(
+  selectedComponents: readonly string[],
+  accountSubdomain: string | null,
+  configuredChannels: number,
+): { status: "complete" | "warning"; detail: string } {
+  const detail =
+    configuredChannels > 0
+      ? "Provided channel credentials are configured. Other channels can be connected later in GSV."
+      : "Messaging channels are installed and can be connected later in GSV.";
+  if (selectedComponents.includes(COMPONENT_CHANNEL_TELEGRAM) && !accountSubdomain) {
+    return {
+      status: "warning",
+      detail: `${detail} Telegram's webhook URL could not be configured because the workers.dev subdomain was unavailable.`,
+    };
+  }
+  return { status: "complete", detail };
 }
 
 async function prepareBundlesForPhase(
@@ -709,6 +920,35 @@ function normalizeComponents(raw: string[]): string[] {
   return out;
 }
 
+export function resolveReleaseComponents(
+  requestedComponents: string[],
+  checksums: ReadonlyMap<string, string>,
+): string[] {
+  const resolved = new Set<string>();
+  const missingBundles: string[] = [];
+  for (const component of requestedComponents) {
+    const bundleFile = COMPONENT_TO_BUNDLE[component];
+    if (!bundleFile) throw new Error(`Unknown component: ${component}`);
+    if (checksums.has(bundleFile)) {
+      resolved.add(component);
+    } else if (component !== LEGACY_COMPONENT_ASSEMBLER) {
+      missingBundles.push(bundleFile);
+    }
+  }
+  if (missingBundles.length > 0) {
+    throw new Error(
+      `Unsupported GSV release: the release does not include the complete stack (${missingBundles.join(", ")}). Choose Latest stable and try again.`,
+    );
+  }
+
+  const assemblerBundle = COMPONENT_TO_BUNDLE[LEGACY_COMPONENT_ASSEMBLER];
+  if (resolved.has(COMPONENT_GATEWAY) && checksums.has(assemblerBundle)) {
+    resolved.add(LEGACY_COMPONENT_ASSEMBLER);
+  }
+
+  return [...resolved].sort((a, b) => deployOrder(a) - deployOrder(b));
+}
+
 function dedupeReleaseOptions(options: ReleaseOption[]): ReleaseOption[] {
   const seen = new Set<string>();
   const out: ReleaseOption[] = [];
@@ -720,41 +960,120 @@ function dedupeReleaseOptions(options: ReleaseOption[]): ReleaseOption[] {
   return out;
 }
 
-function detectGsvInstallations(account: Account, scriptNames: string[]): ExistingGsvInstallation[] {
-  const scripts = new Set(scriptNames);
-  const instances = new Map<string, Set<string>>();
-  for (const scriptName of scripts) {
-    const match = componentForScriptName(scriptName);
-    if (!match) continue;
-    let components = instances.get(match.instance);
+type DetectableWorkerScript = {
+  id: string;
+  tags?: readonly string[];
+};
+
+type DetectedComponent = {
+  scriptName: string;
+  verified: boolean;
+};
+
+export function detectGsvInstallations(
+  account: Account,
+  workerScripts: DetectableWorkerScript[],
+): ExistingGsvInstallation[] {
+  const scripts = new Map(workerScripts.map((script) => [script.id, script]));
+  const instances = new Map<string, Map<string, DetectedComponent>>();
+
+  const addCandidate = (instance: string, component: string, script: DetectableWorkerScript): void => {
+    let components = instances.get(instance);
     if (!components) {
-      components = new Set<string>();
-      instances.set(match.instance, components);
+      components = new Map<string, DetectedComponent>();
+      instances.set(instance, components);
     }
-    components.add(match.component);
+    const candidate = {
+      scriptName: script.id,
+      verified:
+        componentForInstallationScriptName(instance, script.id) === component &&
+        hasExpectedWorkerTags(script.tags ?? [], instance, component),
+    };
+    const existing = components.get(component);
+    if (!existing?.verified || candidate.verified) components.set(component, candidate);
+  };
+
+  // Tags are authoritative and let us discover a named gateway even when it is
+  // the only deployed component. Names remain a read-only compatibility path
+  // for installs that predate GSV management tags.
+  for (const script of workerScripts) {
+    const identity = managedWorkerIdentity(script);
+    if (identity) addCandidate(identity.instance, identity.component, script);
+  }
+
+  for (const script of workerScripts) {
+    const match = componentForScriptName(script.id);
+    if (match) addCandidate(match.instance, match.component, script);
   }
 
   for (const instance of instances.keys()) {
-    if (scripts.has(instance)) instances.get(instance)?.add(COMPONENT_GATEWAY);
+    const gateway = scripts.get(instance);
+    if (gateway) addCandidate(instance, COMPONENT_GATEWAY, gateway);
   }
-  if (scripts.has(SCRIPT_GATEWAY)) {
-    let components = instances.get(DEFAULT_DEPLOY_INSTANCE);
-    if (!components) {
-      components = new Set<string>();
-      instances.set(DEFAULT_DEPLOY_INSTANCE, components);
-    }
-    components.add(COMPONENT_GATEWAY);
-  }
+  const defaultGateway = scripts.get(SCRIPT_GATEWAY);
+  if (defaultGateway) addCandidate(DEFAULT_DEPLOY_INSTANCE, COMPONENT_GATEWAY, defaultGateway);
 
   return [...instances]
     .filter(([, components]) => components.size > 0)
-    .map(([instance, components]) => ({
-      accountId: account.id,
-      accountName: account.name?.trim() || account.id,
-      instance,
-      components: [...components].sort((a, b) => deployOrder(a) - deployOrder(b)),
-      scriptNames: scriptNamesForDetectedInstance(instance, components).filter((name) => scripts.has(name)),
-    }));
+    .map(([instance, detected]) => {
+      const components = [...detected.keys()].sort((a, b) => deployOrder(a) - deployOrder(b));
+      return {
+        accountId: account.id,
+        accountName: account.name?.trim() || account.id,
+        instance,
+        components,
+        scriptNames: components.map((component) => detected.get(component)!.scriptName),
+        deleteSupported: [...detected.values()].every((component) => component.verified),
+      };
+    });
+}
+
+function managedWorkerIdentity(
+  script: DetectableWorkerScript,
+): { instance: string; component: string } | null {
+  const tags = script.tags ?? [];
+  if (!tags.includes(WORKER_TAG_MANAGED)) return null;
+
+  const instances = prefixedTagValues(tags, WORKER_TAG_INSTANCE_PREFIX);
+  const components = prefixedTagValues(tags, WORKER_TAG_COMPONENT_PREFIX);
+  if (instances.length !== 1 || components.length !== 1) return null;
+
+  const instance = instances[0];
+  const component = components[0];
+  if (!instance || !component || !COMPONENT_TO_BUNDLE[component]) return null;
+
+  try {
+    if (scriptNameForComponent(parseInstance(instance), component) !== script.id) return null;
+  } catch {
+    return null;
+  }
+  return { instance, component };
+}
+
+function workerTagsForComponent(instance: string, component: string): string[] {
+  return [
+    WORKER_TAG_MANAGED,
+    `${WORKER_TAG_INSTANCE_PREFIX}${instance}`,
+    `${WORKER_TAG_COMPONENT_PREFIX}${component}`,
+  ];
+}
+
+function hasExpectedWorkerTags(tags: readonly string[], instance: string, component: string): boolean {
+  const managedTags = [...new Set(tags.filter((tag) => tag.startsWith("gsv-managed-")))];
+  const instanceTags = prefixedTagValues(tags, WORKER_TAG_INSTANCE_PREFIX);
+  const componentTags = prefixedTagValues(tags, WORKER_TAG_COMPONENT_PREFIX);
+  return (
+    managedTags.length === 1 &&
+    managedTags[0] === WORKER_TAG_MANAGED &&
+    instanceTags.length === 1 &&
+    instanceTags[0] === instance &&
+    componentTags.length === 1 &&
+    componentTags[0] === component
+  );
+}
+
+function prefixedTagValues(tags: readonly string[], prefix: string): string[] {
+  return [...new Set(tags.filter((tag) => tag.startsWith(prefix)).map((tag) => tag.slice(prefix.length)))];
 }
 
 function componentForScriptName(scriptName: string): { instance: string; component: string } | null {
@@ -763,7 +1082,7 @@ function componentForScriptName(scriptName: string): { instance: string; compone
     ["-channel-whatsapp", COMPONENT_CHANNEL_WHATSAPP],
     ["-channel-discord", COMPONENT_CHANNEL_DISCORD],
     ["-channel-telegram", COMPONENT_CHANNEL_TELEGRAM],
-    ["-assembler", COMPONENT_ASSEMBLER],
+    ["-assembler", LEGACY_COMPONENT_ASSEMBLER],
     ["-ripgit", COMPONENT_RIPGIT],
   ];
   for (const [suffix, component] of suffixes) {
@@ -774,13 +1093,16 @@ function componentForScriptName(scriptName: string): { instance: string; compone
   return scriptName === SCRIPT_GATEWAY ? { instance: DEFAULT_DEPLOY_INSTANCE, component: COMPONENT_GATEWAY } : null;
 }
 
-function scriptNamesForDetectedInstance(instance: string, components: Set<string>): string[] {
+function componentForInstallationScriptName(instance: string, scriptName: string): string | null {
   const deployInstance: DeployInstance = {
     name: instance,
     isDefault: instance === DEFAULT_DEPLOY_INSTANCE,
     storageBucketName: `${instance}-storage`,
   };
-  return [...components].map((component) => scriptNameForComponent(deployInstance, component));
+  for (const component of Object.keys(COMPONENT_TO_BUNDLE)) {
+    if (scriptNameForComponent(deployInstance, component) === scriptName) return component;
+  }
+  return null;
 }
 
 function formatCount(count: number, noun: string): string {
@@ -788,45 +1110,14 @@ function formatCount(count: number, noun: string): string {
 }
 
 function friendlyErrorDetail(message: string): string {
-  const lower = message.toLowerCase();
-  if (lower.includes("credentials expired") || lower.includes("authorize cloudflare")) {
-    return "Your Cloudflare authorization expired. Start a new deployment and authorize Cloudflare again.";
-  }
-  if (lower.includes("instance name")) {
-    return "The GSV instance name is not valid. Use lowercase letters, numbers, and dashes only.";
-  }
-  if (lower.includes("no components selected") || lower.includes("unknown component")) {
-    return "Choose at least one valid GSV component and try the deployment again.";
-  }
-  if (lower.includes("invalid account") || lower.includes("authentication") || lower.includes("unauthorized")) {
-    return "Cloudflare did not accept this authorization. Log in again and approve the requested account access.";
-  }
-  if (lower.includes("forbidden") || lower.includes("permission") || lower.includes("scope")) {
-    return "Cloudflare rejected a deployment request. Reauthorize with the required scopes or check account permissions.";
-  }
-  if (lower.includes("latest stable release") || lower.includes("no dev") || lower.includes("release")) {
-    return "The selected GSV release is not available. Try the stable channel, the dev channel, or a specific release tag.";
-  }
-  if (lower.includes("checksum")) {
-    return "The downloaded release bundle did not match its checksum. Retry the deployment or choose another release.";
-  }
-  if (lower.includes("r2 bucket") || lower.includes("storage/kv") || lower.includes("kv namespace")) {
-    return "Cloudflare could not prepare storage for this GSV. Check that the account has access to the required Workers storage products.";
-  }
-  if (lower.includes("workers/scripts") || lower.includes("upload script") || lower.includes("workers.dev")) {
-    return "Cloudflare could not deploy or expose one of the Workers. Check Workers permissions and account limits.";
-  }
-  if (lower.includes("requires ripgit") || lower.includes("requires assembler")) {
-    return "The gateway depends on ripgit and assembler. Select those components or deploy them first.";
-  }
-  return "Deployment stopped before this step finished. The diagnostics below include the exact service response.";
+  return getDeployHelp(message).detail;
 }
 
 function deployOrder(component: string): number {
   switch (component) {
     case COMPONENT_RIPGIT:
       return 0;
-    case COMPONENT_ASSEMBLER:
+    case LEGACY_COMPONENT_ASSEMBLER:
       return 1;
     case COMPONENT_CHANNEL_WHATSAPP:
       return 2;
@@ -876,7 +1167,7 @@ function scriptNameForComponent(instance: DeployInstance, component: string): st
   switch (component) {
     case COMPONENT_GATEWAY:
       return instance.name;
-    case COMPONENT_ASSEMBLER:
+    case LEGACY_COMPONENT_ASSEMBLER:
       return `${instance.name}-assembler`;
     case COMPONENT_RIPGIT:
       return instance.isDefault ? SCRIPT_RIPGIT : `${instance.name}-ripgit`;
@@ -912,8 +1203,11 @@ function assertGatewayDependenciesAvailable(
   if (!availableScripts.has(scriptNameForComponent(instance, COMPONENT_RIPGIT))) {
     throw new Error("Deploying gateway requires ripgit. Select ripgit or deploy it first.");
   }
-  if (!availableScripts.has(scriptNameForComponent(instance, COMPONENT_ASSEMBLER))) {
-    throw new Error("Deploying gateway requires assembler. Select assembler or deploy it first.");
+  if (
+    selectedComponents.has(LEGACY_COMPONENT_ASSEMBLER) &&
+    !availableScripts.has(scriptNameForComponent(instance, LEGACY_COMPONENT_ASSEMBLER))
+  ) {
+    throw new Error("The selected gateway release requires the legacy assembler Worker.");
   }
 }
 
@@ -921,8 +1215,8 @@ function scriptNameForConfigService(instance: DeployInstance, service: string): 
   switch (service) {
     case SCRIPT_GATEWAY:
       return scriptNameForComponent(instance, COMPONENT_GATEWAY);
-    case SCRIPT_ASSEMBLER:
-      return scriptNameForComponent(instance, COMPONENT_ASSEMBLER);
+    case LEGACY_SCRIPT_ASSEMBLER:
+      return scriptNameForComponent(instance, LEGACY_COMPONENT_ASSEMBLER);
     case SCRIPT_RIPGIT:
       return scriptNameForComponent(instance, COMPONENT_RIPGIT);
     case SCRIPT_CHANNEL_WHATSAPP:
@@ -1031,10 +1325,18 @@ async function prepareBundles(
   const checksumsAsset = await fetchReleaseAsset(env, repoOwner, repoName, version, BUNDLE_CHECKSUMS, "Fetch bundle checksums", logger, source);
   const checksumsText = decodeText(checksumsAsset.bytes);
   const checksums = parseChecksums(checksumsText);
+  const releaseComponents = resolveReleaseComponents(components, checksums);
+  const requestedAssembler = components.includes(LEGACY_COMPONENT_ASSEMBLER);
+  const releaseHasAssembler = releaseComponents.includes(LEGACY_COMPONENT_ASSEMBLER);
+  if (!requestedAssembler && releaseHasAssembler) {
+    await logger.info("This release requires the legacy assembler Worker; including it automatically.");
+  } else if (requestedAssembler && !releaseHasAssembler) {
+    await logger.info("This release does not include the legacy assembler Worker; skipping it.");
+  }
   const bundles: PreparedBundle[] = [];
   const validatedAssets: FetchedReleaseAsset[] = [checksumsAsset];
 
-  for (const component of components) {
+  for (const component of releaseComponents) {
     const bundleFile = COMPONENT_TO_BUNDLE[component];
     const expected = checksums.get(bundleFile);
     if (!expected) throw new Error(`Missing checksum entry for ${bundleFile}.`);
@@ -1393,12 +1695,57 @@ async function ensureStorageResources(
   }
 }
 
-async function listWorkerScripts(accessToken: string, accountId: string): Promise<Map<string, string | null>> {
+async function listWorkerScripts(accessToken: string, accountId: string): Promise<Map<string, WorkerScriptDetails>> {
   const result = await cloudflareApi<unknown>(accessToken, `/accounts/${accountId}/workers/scripts`, {}, "List Workers scripts");
   const scripts = decodeList<WorkerScriptSummary>(result, ["scripts", "items"]);
-  const out = new Map<string, string | null>();
-  for (const script of scripts) out.set(script.id, script.migration_tag ?? null);
+  const out = new Map<string, WorkerScriptDetails>();
+  for (const script of scripts) {
+    out.set(script.id, {
+      migrationTag: script.migration_tag ?? null,
+      tags: Array.isArray(script.tags) ? script.tags.filter((tag): tag is string => typeof tag === "string") : [],
+    });
+  }
   return out;
+}
+
+function subscriptionIsActive(state: string | undefined): boolean {
+  const normalized = state?.trim().toLowerCase();
+  return normalized === "trial" || normalized === "provisioned" || normalized === "paid";
+}
+
+export function workersPaidFromSubscriptions(subscriptions: CloudflareSubscription[]): boolean {
+  return subscriptions.some((subscription) =>
+    subscriptionIsActive(subscription.state) &&
+    subscription.rate_plan?.scope?.trim().toLowerCase() === "account" &&
+    subscription.rate_plan?.id?.trim().toLowerCase() === "workers_paid"
+  );
+}
+
+async function resolveWorkersPaid(
+  accessToken: string,
+  accountId: string,
+  logger: DeployLogger,
+): Promise<boolean> {
+  try {
+    const subscriptions = await cloudflareApi<CloudflareSubscription[]>(
+      accessToken,
+      `/accounts/${accountId}/subscriptions`,
+      {},
+      "List account subscriptions",
+    );
+    const workersPaid = workersPaidFromSubscriptions(subscriptions);
+    await logger.info(
+      workersPaid
+        ? "Workers Paid verified; enabling CodeMode and ripgit's extended CPU limit."
+        : "Workers Free detected; omitting CodeMode and paid-only Worker limits.",
+    );
+    return workersPaid;
+  } catch (error) {
+    await logger.warning(
+      `Could not verify the Workers plan; deploying the Free-compatible configuration without CodeMode or paid-only Worker limits: ${error instanceof Error ? error.message : String(error)}.`,
+    );
+    return false;
+  }
 }
 
 async function ensureR2Bucket(
@@ -1502,6 +1849,7 @@ type MetadataOptions = {
   scriptExists: boolean;
   uploadedAssets: UploadedAssets | null;
   keepAssets: boolean;
+  workersPaid: boolean;
   logger: InfoLogger;
 };
 
@@ -1559,8 +1907,10 @@ export async function buildUploadMetadata(
     bindings.push(value);
   }
 
-  for (const loader of bundle.wrangler.worker_loaders ?? []) {
-    bindings.push({ name: loader.binding, type: "worker_loader" });
+  if (options.workersPaid) {
+    for (const loader of bundle.wrangler.worker_loaders ?? []) {
+      bindings.push({ name: loader.binding, type: "worker_loader" });
+    }
   }
 
   if (bundle.wrangler.ai) {
@@ -1588,6 +1938,7 @@ export async function buildUploadMetadata(
     main_module: bundle.entrypointPartName,
     bindings,
     compatibility_date: compatibilityDate,
+    tags: workerTagsForComponent(options.instance.name, bundle.component),
   };
 
   if (bundle.wrangler.compatibility_flags?.length) {
@@ -1602,13 +1953,20 @@ export async function buildUploadMetadata(
     }
   }
   if (bundle.wrangler.observability) metadata.observability = bundle.wrangler.observability;
-  if (bundle.wrangler.limits) metadata.limits = bundle.wrangler.limits;
+  const paidLimits = paidLimitsForBundle(bundle);
+  if (options.workersPaid && paidLimits) metadata.limits = paidLimits;
   if (options.uploadedAssets) {
     metadata.assets = { jwt: options.uploadedAssets.jwt, config: options.uploadedAssets.config };
   }
   if (options.keepAssets) metadata.keep_assets = true;
 
   return metadata;
+}
+
+function paidLimitsForBundle(bundle: PreparedBundle): NonNullable<WranglerConfig["limits"]> | undefined {
+  if (bundle.wrangler.limits) return bundle.wrangler.limits;
+  if (bundle.component === COMPONENT_RIPGIT) return { cpu_ms: RIPGIT_PAID_CPU_LIMIT_MS };
+  return undefined;
 }
 
 function serviceBindingsForBundle(

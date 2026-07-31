@@ -3,8 +3,8 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { DeployJobState } from "../src/deploy-job";
-import { DeployJobWriter, getDeployCredentials, toPublicDeployJob } from "../src/jobs";
-import type { AppEnv, DeployCredentialRecord, DeployJob } from "../src/types";
+import { DeleteJobWriter, DeployJobWriter, getDeployCredentials, toPublicDeployJob } from "../src/jobs";
+import type { AppEnv, DeleteJob, DeployCredentialRecord, DeployJob } from "../src/types";
 
 const bindings = env as unknown as AppEnv["Bindings"];
 
@@ -66,6 +66,28 @@ describe("DeployJobState", () => {
       detail: "Retry in a moment.",
     });
     expect(await stub.getCredentials()).toBeNull();
+  });
+
+  it("stores deletion progress separately from deployment jobs", async () => {
+    const stub = bindings.DEPLOY_JOBS.getByName("delete-state");
+    const job = sampleDeleteJob("delete-state");
+    await stub.initializeDeletion(job, sampleCredentials());
+
+    expect(await stub.getJob()).toBeNull();
+    expect(await stub.getDeletion()).toEqual(job);
+
+    const writer = await DeleteJobWriter.load(bindings, job.id);
+    expect(writer).not.toBeNull();
+    await writer!.updateStep("workers", "complete", "Services removed.", { flush: false });
+    await writer!.appendLog("info", "Services removed.", { flush: false });
+    await writer!.flush(true);
+
+    expect(await stub.getDeletion()).toMatchObject({
+      steps: expect.arrayContaining([
+        expect.objectContaining({ id: "workers", status: "complete", detail: "Services removed." }),
+      ]),
+      logs: expect.arrayContaining([expect.objectContaining({ message: "Services removed." })]),
+    });
   });
 
   it("deletes expired job and credential state when its alarm runs", async () => {
@@ -193,5 +215,33 @@ function sampleCredentials(): DeployCredentialRecord {
     },
     accessTokenExpiresAt: Date.now() + 3_600_000,
     adapterSecrets: { discordBotToken: "discord-secret" },
+  };
+}
+
+function sampleDeleteJob(id: string): DeleteJob {
+  const now = Date.now();
+  return {
+    kind: "delete",
+    id,
+    sessionId: "session-id",
+    viewTokenHash: "view-token-hash",
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    options: {
+      accountId: "account-id",
+      accountName: "Test account",
+      instance: "gsv",
+      scriptNames: ["gsv", "ripgit"],
+    },
+    steps: [
+      {
+        id: "workers",
+        title: "Remove GSV services",
+        description: "Delete services.",
+        status: "pending",
+      },
+    ],
+    logs: [{ at: now, level: "info", message: "Queued deletion." }],
   };
 }

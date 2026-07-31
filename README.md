@@ -42,13 +42,13 @@ Create a Cloudflare OAuth client:
 - Response type: `code`
 - Grant types: `authorization_code`, `refresh_token`
 - Token authentication method: `client_secret_post`
-- Client URL: `https://gsv-deployment.the-agents-company.workers.dev`
-- Privacy policy URL: `https://gsv-deployment.the-agents-company.workers.dev/privacy`
-- Terms URL: `https://gsv-deployment.the-agents-company.workers.dev/terms`
+- Client URL: `https://deploy.gsv.space`
+- Privacy policy URL: `https://deploy.gsv.space/privacy`
+- Terms URL: `https://deploy.gsv.space/terms`
 - Redirect URL:
 
 ```text
-https://gsv-deployment.the-agents-company.workers.dev/oauth/callback
+https://deploy.gsv.space/oauth/callback
 ```
 
 Use the scopes in `wrangler.jsonc` as the starting point for the client. The
@@ -59,6 +59,28 @@ publishing the client:
 curl https://api.cloudflare.com/client/v4/oauth/scopes \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
 ```
+
+The installer uses `billing.read` only to check whether the selected account
+has an active Workers Paid subscription. Free accounts—and accounts whose plan
+cannot be verified—are deployed without CodeMode's Worker Loader binding or
+ripgit's paid-only CPU limit.
+
+When adding `billing.read` to an existing OAuth client, also enable that scope
+for the client in the Cloudflare dashboard. Changing `OAUTH_SCOPES` only changes
+what the installer requests; existing users must authorize again before their
+access token contains the new scope.
+
+Component compatibility comes from each release's checksum manifest. Releases
+that publish the legacy assembler bundle deploy it automatically with the
+gateway; releases without that checksum never attempt to fetch or deploy it.
+The installer always deploys the complete supported GSV stack, so users do not
+need to choose or understand its internal Worker components.
+
+Every uploaded GSV Worker receives the same management-tag contract used by
+the `gsv` CLI: `gsv-managed-v1`, `gsv-instance-<name>`, and
+`gsv-component-<component>`. The overview may show older name-matched installs
+so they can be updated, but it only enables deletion when every target Worker
+has matching management tags.
 
 Set the deployed installer URL in `APP_ORIGIN`, then set secrets:
 
@@ -117,7 +139,7 @@ write — no setup needed):
 
 - `login_view`: recorded on every `GET /login` hit, tagged `cta` (link click
   from the home page) or `session_expired` (redirected here after an
-  expired/missing session on `/deploy` or `/jobs/:id`).
+  expired/missing session on `/manage`, `/deploy`, or `/jobs/:id`).
 - `deploy_view`: recorded on every `GET /deploy` that passes session auth,
   tagged `has_accounts` or `no_accounts` depending on whether Cloudflare
   returned an authorized account for the session.

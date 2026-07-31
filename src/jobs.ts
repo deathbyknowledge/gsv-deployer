@@ -2,12 +2,17 @@ import {
   appendLogToJob,
   failActiveStepOnJob,
   JOB_TTL_SECONDS,
+  updateDeleteStepOnJob,
   updateStepOnJob,
 } from "./deploy-job";
 import { randomToken, refreshAccessToken, timingSafeEqual } from "./oauth";
 import type {
   ActiveDeployCredentials,
   AppEnv,
+  DeleteJob,
+  DeleteOptions,
+  DeleteStep,
+  DeleteStepId,
   DeployAdapterSecrets,
   DeployCredentialRecord,
   DeployJob,
@@ -16,6 +21,7 @@ import type {
   DeployStepId,
   DeployStepStatus,
   PublicDeployJob,
+  PublicDeleteJob,
   TokenResponse,
 } from "./types";
 
@@ -38,6 +44,18 @@ export type CreateDeployJobInput = {
 
 export type CreatedDeployJob = {
   job: DeployJob;
+  viewToken: string;
+};
+
+export type CreateDeleteJobInput = {
+  sessionId: string;
+  options: DeleteOptions;
+  token: TokenResponse;
+  tokenIssuedAt?: number;
+};
+
+export type CreatedDeleteJob = {
+  job: DeleteJob;
   viewToken: string;
 };
 
@@ -101,6 +119,66 @@ export class DeployJobWriter {
   }
 }
 
+export class DeleteJobWriter {
+  private dirty = false;
+  private lastFlushAt = 0;
+
+  private constructor(
+    private readonly env: AppEnv["Bindings"],
+    readonly job: DeleteJob,
+  ) {}
+
+  static async load(env: AppEnv["Bindings"], jobId: string): Promise<DeleteJobWriter | null> {
+    const job = await deployJobState(env, jobId).getDeletion();
+    return job ? new DeleteJobWriter(env, job) : null;
+  }
+
+  async appendLog(level: "info" | "warning" | "error", message: string, options?: FlushOptions): Promise<void> {
+    appendLogToJob(this.job, level, message);
+    await this.markDirty(options);
+  }
+
+  async update(patch: Partial<DeleteJob>, options?: FlushOptions): Promise<void> {
+    Object.assign(this.job, patch);
+    await this.markDirty(options);
+  }
+
+  async updateStep(
+    stepId: DeleteStepId,
+    status: DeployStepStatus,
+    detail?: string,
+    options?: FlushOptions,
+  ): Promise<void> {
+    updateDeleteStepOnJob(this.job, stepId, status, detail);
+    await this.markDirty(options);
+  }
+
+  async failActiveStep(detail: string, options?: FlushOptions): Promise<void> {
+    failActiveStepOnJob(this.job, detail);
+    await this.markDirty(options);
+  }
+
+  async flush(force = false): Promise<void> {
+    if (!this.dirty && !force) return;
+    const merged = await deployJobState(this.env, this.job.id).mergeDeletion(this.job);
+    Object.assign(this.job, merged);
+    this.dirty = false;
+    this.lastFlushAt = Date.now();
+  }
+
+  private async markDirty(options?: FlushOptions): Promise<void> {
+    this.dirty = true;
+    this.job.updatedAt = Date.now();
+    if (options?.flush === false) return;
+    await this.flushIfDue();
+  }
+
+  private async flushIfDue(): Promise<void> {
+    if (Date.now() - this.lastFlushAt < JOB_FLUSH_INTERVAL_MS) return;
+    await this.flush();
+  }
+}
+
 export async function createJob(
   env: AppEnv["Bindings"],
   input: CreateDeployJobInput,
@@ -128,10 +206,38 @@ export async function createJob(
   return { job, viewToken };
 }
 
+export async function createDeleteJob(
+  env: AppEnv["Bindings"],
+  input: CreateDeleteJobInput,
+): Promise<CreatedDeleteJob> {
+  const now = Date.now();
+  const id = randomToken();
+  const viewToken = randomToken();
+  const job: DeleteJob = {
+    kind: "delete",
+    id,
+    sessionId: input.sessionId,
+    viewTokenHash: await hashJobViewToken(id, viewToken),
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    options: input.options,
+    steps: createDeleteSteps(input.options, now),
+    logs: [{ at: now, level: "info", message: "Queued deletion." }],
+  };
+  const credentials = createDeployCredentialRecord(input.token, input.tokenIssuedAt ?? now);
+  await deployJobState(env, id).initializeDeletion(job, credentials);
+  return { job, viewToken };
+}
+
 export async function getJob(env: AppEnv["Bindings"], jobId: string): Promise<DeployJob | null> {
   const current = await deployJobState(env, jobId).getJob();
   if (current) return current;
   return (await readLegacyJob(env, jobId))?.job ?? null;
+}
+
+export function getDeleteJob(env: AppEnv["Bindings"], jobId: string): Promise<DeleteJob | null> {
+  return deployJobState(env, jobId).getDeletion();
 }
 
 export function appendLog(
@@ -150,6 +256,15 @@ export function markJobStartFailure(
   message: string,
 ): Promise<void> {
   return deployJobState(env, jobId).failWorkflowStart(detail, message);
+}
+
+export function markDeleteJobStartFailure(
+  env: AppEnv["Bindings"],
+  jobId: string,
+  detail: string,
+  message: string,
+): Promise<void> {
+  return deployJobState(env, jobId).failDeletionWorkflowStart(detail, message);
 }
 
 export async function getDeployCredentials(
@@ -186,7 +301,7 @@ export async function deleteDeployCredentials(env: AppEnv["Bindings"], jobId: st
   }
 }
 
-export async function verifyJobViewToken(job: DeployJob, token: string | null): Promise<boolean> {
+export async function verifyJobViewToken(job: DeployJob | DeleteJob, token: string | null): Promise<boolean> {
   if (!token || !job.viewTokenHash) return false;
   const hash = await hashJobViewToken(job.id, token);
   return timingSafeEqual(hash, job.viewTokenHash);
@@ -201,6 +316,11 @@ export function toPublicDeployJob(job: DeployJob): PublicDeployJob {
     ...publicOptions
   } = options;
   return { ...publicJob, options: publicOptions };
+}
+
+export function toPublicDeleteJob(job: DeleteJob): PublicDeleteJob {
+  const { sessionId: _sessionId, viewTokenHash: _viewTokenHash, ...publicJob } = job;
+  return publicJob;
 }
 
 function deployJobState(env: AppEnv["Bindings"], jobId: string) {
@@ -343,8 +463,8 @@ function createDeploySteps(options: DeployOptions, now: number): DeployStep[] {
     },
     {
       id: "prepare",
-      title: "Prepare components",
-      description: "Download and verify the selected GSV components.",
+      title: "Prepare GSV",
+      description: "Download and verify the selected GSV release.",
       status: "pending",
     },
     {
@@ -371,7 +491,7 @@ function createDeploySteps(options: DeployOptions, now: number): DeployStep[] {
     steps.push({
       id: "adapters",
       title: "Configure channels",
-      description: "Apply channel settings and optional bot tokens.",
+      description: "Prepare messaging channels for setup in GSV.",
       status: "pending",
     });
   }
@@ -384,4 +504,36 @@ function createDeploySteps(options: DeployOptions, now: number): DeployStep[] {
   });
 
   return steps;
+}
+
+function createDeleteSteps(options: DeleteOptions, now: number): DeleteStep[] {
+  const account = options.accountName?.trim() || options.accountId;
+  return [
+    {
+      id: "authorize",
+      title: "Authorize Cloudflare",
+      description: "Confirm access to the selected Cloudflare account.",
+      status: "complete",
+      detail: `Authorized ${account}.`,
+      updatedAt: now,
+    },
+    {
+      id: "workers",
+      title: "Remove GSV services",
+      description: "Delete the installation and its Durable Object data.",
+      status: "pending",
+    },
+    {
+      id: "storage",
+      title: "Remove files and storage",
+      description: "Permanently delete every R2 object and the storage bucket.",
+      status: "pending",
+    },
+    {
+      id: "finish",
+      title: "Finish deletion",
+      description: "Confirm that all deployment-owned resources are gone.",
+      status: "pending",
+    },
+  ];
 }
