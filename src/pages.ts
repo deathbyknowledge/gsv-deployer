@@ -84,7 +84,7 @@ export function deployPage(
   const instanceValue = (!isUpdate && prefill?.instance) || "gsv";
   const advancedOpen = !isUpdate && instanceValue !== "gsv" ? " open" : "";
   const note = isUpdate
-    ? `<p class="prose retry-note">Choose a release and the components you want, then apply the update. Any Discord or Telegram bot tokens need to be re-entered.</p>`
+    ? `<p class="prose retry-note">Choose a release and the components to deploy or refresh, then apply the update. Components left unchecked are not removed. Any Discord or Telegram bot tokens need to be re-entered.</p>`
     : prefill
       ? `<p class="prose retry-note">Retrying your last deployment. Review the settings below and deploy again. Any Discord or Telegram bot tokens need to be re-entered.</p>`
       : "";
@@ -111,7 +111,7 @@ export function deployPage(
 
   const heading = isUpdate ? `Update ${escapeHtml(prefill!.instance!)}` : "Deploy a new GSV";
   const intro = isUpdate
-    ? "Adjust the release and components for this GSV, then apply the update."
+    ? "Choose the release and components to deploy or refresh for this GSV."
     : "Choose where this GSV should live and which release to install.";
   // Advanced options only apply to a new deploy: the install name and the
   // read-only summary of the Cloudflare access you granted at login. Updating an
@@ -149,6 +149,7 @@ ${note}
   </label>
   <div>
     <h2>Components</h2>
+    ${isUpdate ? `<p class="hint">Unchecked existing components stay deployed.</p>` : ""}
     <div class="checks">${componentChecks}</div>
   </div>
   ${advancedSection}
@@ -197,8 +198,9 @@ export function managePage(installations: ExistingGsvInstallation[]): string {
   <span class="component-badges">${install.components.map((component) => `<span>${escapeHtml(componentName(component))}</span>`).join("")}</span>
   <div class="actions left">
     <a class="link-button" href="${escapeHtml(manageUpdateHref(install))}">Update</a>
-    <a class="link-button danger" href="${escapeHtml(manageDeleteHref(install))}">Delete</a>
+    ${install.deleteSupported ? `<a class="link-button danger" href="${escapeHtml(manageDeleteHref(install))}">Delete</a>` : ""}
   </div>
+  ${install.deleteSupported ? "" : `<p class="hint">These Workers do not have matching GSV management tags. They may be a legacy install or a name collision, so verify them in Cloudflare before updating. Deletion is disabled here; any older assembler Worker may still need manual removal.</p>`}
 </li>`,
     )
     .join("");
@@ -206,7 +208,7 @@ export function managePage(installations: ExistingGsvInstallation[]): string {
   const count = installations.length === 1 ? "One GSV install" : `${installations.length} GSV installs`;
   return `<p class="eyebrow"><a href="/logout">Log out</a></p>
 <h1 class="page-title title-row">${cloudflareMark()} Your GSVs</h1>
-<p class="prose">${count} detected in your Cloudflare accounts. Pick one to update or delete, or deploy a new install.</p>
+<p class="prose">${count} detected in your Cloudflare accounts. Pick one to update, delete a verified install, or deploy a new GSV.</p>
 <section class="section">
   <ul class="manage-list">${cards}</ul>
 </section>

@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 
 export { GsvDeployWorkflow } from "./workflow";
 export { DeployJobState } from "./deploy-job";
@@ -77,7 +77,8 @@ app.get("/", async (c) => {
 
 app.get("/login", (c) => {
   const referer = c.req.header("referer") ?? "";
-  const isSessionExpiredRedirect = referer.includes("/deploy") || referer.includes("/jobs/") || referer.includes("/manage");
+  const isSessionExpiredRedirect =
+    Boolean(c.req.query("returnTo")) || referer.includes("/deploy") || referer.includes("/jobs/") || referer.includes("/manage");
   trackRequestEvent(c.env, c.req.raw, "login_view", isSessionExpiredRedirect ? "session_expired" : "cta", requestCountry(c.req.raw));
   return startLogin(c);
 });
@@ -91,7 +92,7 @@ app.get("/manage", async (c) => {
   try {
     session = await requireSession(c);
   } catch {
-    return c.redirect("/login");
+    return redirectToLogin(c);
   }
 
   const accounts = await fetchAccounts(session.session.token.access_token);
@@ -110,7 +111,7 @@ app.get("/manage/delete", async (c) => {
   try {
     session = await requireSession(c);
   } catch {
-    return c.redirect("/login");
+    return redirectToLogin(c);
   }
 
   const accountId = c.req.query("accountId") ?? "";
@@ -118,7 +119,7 @@ app.get("/manage/delete", async (c) => {
   const accounts = await fetchAccounts(session.session.token.access_token);
   const installations = await findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []);
   const install = installations.find((item) => item.accountId === accountId && item.instance === instance);
-  if (!install) return c.redirect("/manage");
+  if (!install || !install.deleteSupported) return c.redirect("/manage");
 
   return page(c, {
     title: `Delete ${install.instance}`,
@@ -132,7 +133,7 @@ app.post("/manage/delete", async (c) => {
   try {
     session = await requireSession(c);
   } catch {
-    return c.redirect("/login");
+    return redirectToLogin(c);
   }
 
   const form = await c.req.formData();
@@ -143,7 +144,7 @@ app.post("/manage/delete", async (c) => {
   // GSV install in one of this session's authorized accounts.
   const installations = await findExistingGsvInstallations(session.session.token.access_token, accounts).catch(() => []);
   const install = installations.find((item) => item.accountId === accountId && item.instance === instance);
-  if (!install) return c.redirect("/manage");
+  if (!install || !install.deleteSupported) return c.redirect("/manage");
 
   const deleteStorage = stringField(form, "deleteStorage") === "1";
   const result = await deleteGsvInstallation(session.session.token.access_token, install, { deleteStorage });
@@ -176,7 +177,7 @@ app.get("/deploy", async (c) => {
   try {
     session = await requireSession(c);
   } catch {
-    return c.redirect("/login");
+    return redirectToLogin(c);
   }
 
   const accounts = await fetchAccounts(session.session.token.access_token);
@@ -198,7 +199,7 @@ app.post("/deploy", async (c) => {
   try {
     current = await requireSession(c);
   } catch {
-    return c.redirect("/login");
+    return redirectToLogin(c);
   }
 
   const form = await c.req.formData();
@@ -215,6 +216,16 @@ app.post("/deploy", async (c) => {
   }
 
   const components = form.getAll("component").map(String).filter((value) => ALL_COMPONENTS.includes(value as (typeof ALL_COMPONENTS)[number]));
+  if (existingTarget && components.length === 0) {
+    return page(c, {
+      title: "No components selected",
+      body: errorPage(
+        "No components selected",
+        "Select at least one component to deploy or refresh. Existing components left unchecked stay deployed.",
+      ),
+      status: 400,
+    });
+  }
   const options: DeployOptions = {
     accountId,
     accountName: account.name,
@@ -291,7 +302,7 @@ app.get("/jobs/:id", async (c) => {
   const current = await getSessionWithId(c);
   const canView = await canViewJob(c.req.raw, job, current?.sessionId);
   if (!canView) {
-    if (!current) return c.redirect("/login");
+    if (!current) return redirectToLogin(c);
     return page(c, {
       title: "Not Found",
       body: errorPage("Not Found", "Deployment job was not found."),
@@ -432,8 +443,8 @@ app.get("/preview/:kind", (c) => {
   }
   const kind = c.req.param("kind");
   const previewInstalls = [
-    { accountId: "acc1", accountName: "My Cloudflare", instance: "gsv", components: ["gateway", "ripgit", "assembler"], scriptNames: [] },
-    { accountId: "acc2", accountName: "Other account", instance: "gsv-work", components: ["gateway", "ripgit", "assembler", "channel-discord"], scriptNames: [] },
+    { accountId: "acc1", accountName: "My Cloudflare", instance: "gsv", components: ["gateway", "ripgit", "assembler"], scriptNames: [], deleteSupported: false },
+    { accountId: "acc2", accountName: "Other account", instance: "gsv-work", components: ["gateway", "ripgit", "assembler", "channel-discord"], scriptNames: [], deleteSupported: true },
   ];
   if (kind === "manage") {
     return page(c, { title: "Your GSVs", body: managePage(previewInstalls), width: "wide" });
@@ -450,6 +461,7 @@ app.get("/preview/:kind", (c) => {
         instance: "gsv-work",
         components: ["gateway", "ripgit", "assembler", "channel-discord"],
         scriptNames: ["gsv-work", "gsv-work-ripgit", "gsv-work-assembler", "gsv-work-channel-discord"],
+        deleteSupported: true,
       }),
       width: "wide",
     });
@@ -658,6 +670,12 @@ function redirectWithCookies(location: string, cookies: string[]): Response {
   const headers = new Headers({ Location: location });
   for (const cookie of cookies) headers.append("Set-Cookie", cookie);
   return new Response(null, { status: 302, headers });
+}
+
+function redirectToLogin(c: Context<AppEnv>): Response {
+  const url = new URL(c.req.url);
+  const returnTo = `${url.pathname}${url.search}`;
+  return c.redirect(`/login?returnTo=${encodeURIComponent(returnTo)}`);
 }
 
 export default {

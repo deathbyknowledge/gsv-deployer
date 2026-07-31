@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ALL_COMPONENTS,
   buildUploadMetadata,
+  deleteGsvInstallation,
+  detectGsvInstallations,
   resolveReleaseComponents,
   workersPaidFromSubscriptions,
 } from "../src/deploy";
@@ -11,6 +13,10 @@ type UploadBundle = Parameters<typeof buildUploadMetadata>[2];
 type MetadataOptions = Parameters<typeof buildUploadMetadata>[3];
 
 describe("deployment compatibility", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("deploys only current GSV components", () => {
     expect(ALL_COMPONENTS).not.toContain("assembler");
   });
@@ -59,6 +65,11 @@ describe("deployment compatibility", () => {
     expect(paidMetadata.limits).toEqual({ cpu_ms: 300_000 });
     expect(freeMetadata.bindings).not.toContainEqual({ name: "LOADER", type: "worker_loader" });
     expect(freeMetadata).not.toHaveProperty("limits");
+    expect(freeMetadata.tags).toEqual([
+      "gsv-managed-v1",
+      "gsv-instance-gsv",
+      "gsv-component-ripgit",
+    ]);
   });
 
   it("preserves release-provided limits for verified paid accounts", async () => {
@@ -91,7 +102,133 @@ describe("deployment compatibility", () => {
       expect(workersPaidFromSubscriptions([subscription])).toBe(false);
     }
   });
+
+  it("uses management tags as the deletion boundary while retaining legacy discovery", () => {
+    const account = { id: "account-id", name: "Account" };
+    const managed = detectGsvInstallations(account, [
+      { id: "gsv", tags: workerTags("gsv", "gateway") },
+      { id: "ripgit", tags: workerTags("gsv", "ripgit") },
+    ]);
+    expect(managed).toEqual([
+      expect.objectContaining({
+        instance: "gsv",
+        components: ["ripgit", "gateway"],
+        scriptNames: ["ripgit", "gsv"],
+        deleteSupported: true,
+      }),
+    ]);
+
+    const legacy = detectGsvInstallations(account, [
+      { id: "gsv" },
+      { id: "ripgit" },
+    ]);
+    expect(legacy[0]).toEqual(expect.objectContaining({ instance: "gsv", deleteSupported: false }));
+
+    const mixedLegacy = detectGsvInstallations(account, [
+      { id: "gsv", tags: workerTags("gsv", "gateway") },
+      { id: "ripgit", tags: workerTags("gsv", "ripgit") },
+      { id: "gsv-assembler" },
+    ]);
+    expect(mixedLegacy[0]).toEqual(
+      expect.objectContaining({
+        components: ["ripgit", "assembler", "gateway"],
+        deleteSupported: false,
+      }),
+    );
+
+    const taggedGatewayOnly = detectGsvInstallations(account, [
+      { id: "gsv-work", tags: workerTags("gsv-work", "gateway") },
+    ]);
+    expect(taggedGatewayOnly[0]).toEqual(
+      expect.objectContaining({ instance: "gsv-work", components: ["gateway"], deleteSupported: true }),
+    );
+
+    const inconsistentName = detectGsvInstallations(account, [
+      { id: "gsv-ripgit", tags: workerTags("gsv", "ripgit") },
+    ]);
+    expect(inconsistentName[0]).toEqual(expect.objectContaining({ deleteSupported: false }));
+  });
+
+  it("keeps storage when any Worker deletion fails", async () => {
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      requests.push(`${method} ${url}`);
+
+      if (method === "GET" && url.endsWith("/workers/scripts")) {
+        return cloudflareResponse([
+          { id: "gsv", tags: workerTags("gsv", "gateway") },
+          { id: "ripgit", tags: workerTags("gsv", "ripgit") },
+        ]);
+      }
+      if (method === "DELETE" && url.includes("/workers/scripts/gsv?")) {
+        return cloudflareResponse(null, 500, [{ message: "delete failed" }]);
+      }
+      if (method === "DELETE" && url.includes("/workers/scripts/ripgit?")) {
+        return cloudflareResponse(null);
+      }
+      if (url.includes("/r2/buckets/")) return cloudflareResponse(null);
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    }));
+
+    const result = await deleteGsvInstallation(
+      "access-token",
+      {
+        accountId: "account-id",
+        accountName: "Account",
+        instance: "gsv",
+        components: ["ripgit", "gateway"],
+        scriptNames: ["ripgit", "gsv"],
+        deleteSupported: true,
+      },
+      { deleteStorage: true },
+    );
+
+    expect(result.failed).toEqual([expect.objectContaining({ script: "gsv" })]);
+    expect(result.storage).toBeUndefined();
+    expect(requests.some((request) => request.includes("/r2/buckets/"))).toBe(false);
+  });
+
+  it("revalidates management tags before the first deletion", async () => {
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      requests.push(`${method} ${url}`);
+      if (method === "GET" && url.endsWith("/workers/scripts")) {
+        return cloudflareResponse([
+          { id: "gsv", tags: workerTags("another-instance", "gateway") },
+        ]);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    }));
+
+    const result = await deleteGsvInstallation("access-token", {
+      accountId: "account-id",
+      accountName: "Account",
+      instance: "gsv",
+      components: ["gateway"],
+      scriptNames: ["gsv"],
+      deleteSupported: true,
+    });
+
+    expect(result.deleted).toEqual([]);
+    expect(result.failed[0]?.error).toContain("ownership changed");
+    expect(requests.every((request) => request.startsWith("GET "))).toBe(true);
+  });
 });
+
+function workerTags(instance: string, component: string): string[] {
+  return ["gsv-managed-v1", `gsv-instance-${instance}`, `gsv-component-${component}`];
+}
+
+function cloudflareResponse(result: unknown, status = 200, errors: Array<{ message: string }> = []): Response {
+  return new Response(JSON.stringify({ success: status < 400, result, errors }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 function ripgitBundle(): UploadBundle {
   return {

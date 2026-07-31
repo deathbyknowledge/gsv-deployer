@@ -33,6 +33,9 @@ const SCRIPT_CHANNEL_WHATSAPP = "gsv-channel-whatsapp";
 const SCRIPT_CHANNEL_DISCORD = "gsv-channel-discord";
 const SCRIPT_CHANNEL_TELEGRAM = "gsv-channel-telegram";
 const RIPGIT_PAID_CPU_LIMIT_MS = 300_000;
+const WORKER_TAG_MANAGED = "gsv-managed-v1";
+const WORKER_TAG_INSTANCE_PREFIX = "gsv-instance-";
+const WORKER_TAG_COMPONENT_PREFIX = "gsv-component-";
 const WORKERS_SUBDOMAIN_API_DATE = "2025-08-01";
 const MAX_SOURCE_MAP_UPLOAD_BYTES = 2 * 1024 * 1024;
 const DEPLOY_WORKFLOW_STEP_CONFIG = {
@@ -85,6 +88,7 @@ export type ExistingGsvInstallation = {
   instance: string;
   components: string[];
   scriptNames: string[];
+  deleteSupported: boolean;
 };
 
 type BundleManifest = {
@@ -183,6 +187,12 @@ type CloudflareApiResponse<T> = {
 type WorkerScriptSummary = {
   id: string;
   migration_tag?: string | null;
+  tags?: string[] | null;
+};
+
+type WorkerScriptDetails = {
+  migrationTag: string | null;
+  tags: string[];
 };
 
 type CloudflareSubscription = {
@@ -318,7 +328,12 @@ export async function findExistingGsvInstallations(
   for (const account of accounts) {
     try {
       const scripts = await listWorkerScripts(accessToken, account.id);
-      installations.push(...detectGsvInstallations(account, [...scripts.keys()]));
+      installations.push(
+        ...detectGsvInstallations(
+          account,
+          [...scripts].map(([id, details]) => ({ id, tags: details.tags })),
+        ),
+      );
     } catch {
       // Account inspection is opportunistic. The deploy form should still render.
     }
@@ -358,6 +373,38 @@ export async function deleteGsvInstallation(
   installation: ExistingGsvInstallation,
   options: DeleteInstallationOptions = {},
 ): Promise<DeleteInstallationResult> {
+  if (!installation.deleteSupported) {
+    return refusedDeletionResult(
+      installation,
+      "Worker ownership could not be verified from GSV management tags.",
+    );
+  }
+
+  let currentScripts: Map<string, WorkerScriptDetails>;
+  try {
+    currentScripts = await listWorkerScripts(accessToken, installation.accountId);
+  } catch (error) {
+    return refusedDeletionResult(
+      installation,
+      `Worker ownership could not be reverified: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const unsafeScripts = installation.scriptNames.filter((scriptName) => {
+    const details = currentScripts.get(scriptName);
+    if (!details) return false;
+    const component = componentForInstallationScriptName(installation.instance, scriptName);
+    return !component || !hasExpectedWorkerTags(details.tags, installation.instance, component);
+  });
+  if (unsafeScripts.length > 0) {
+    return {
+      deleted: [],
+      failed: unsafeScripts.map((script) => ({
+        script,
+        error: "Worker ownership changed or could not be verified from GSV management tags.",
+      })),
+    };
+  }
+
   const deleted: string[] = [];
   const failed: Array<{ script: string; error: string }> = [];
   // Delete the gateway (and other dependents) before their dependencies.
@@ -372,7 +419,7 @@ export async function deleteGsvInstallation(
   }
 
   const result: DeleteInstallationResult = { deleted, failed };
-  if (options.deleteStorage) {
+  if (options.deleteStorage && failed.length === 0) {
     const bucketName = storageBucketNameForInstance(installation.instance);
     try {
       await deleteR2Bucket(accessToken, installation.accountId, bucketName);
@@ -382,6 +429,17 @@ export async function deleteGsvInstallation(
     }
   }
   return result;
+}
+
+function refusedDeletionResult(
+  installation: ExistingGsvInstallation,
+  error: string,
+): DeleteInstallationResult {
+  const scripts = installation.scriptNames.length > 0 ? installation.scriptNames : [installation.instance];
+  return {
+    deleted: [],
+    failed: scripts.map((script) => ({ script, error })),
+  };
 }
 
 async function deleteR2Bucket(accessToken: string, accountId: string, bucketName: string): Promise<void> {
@@ -617,7 +675,7 @@ async function deployWorkerScripts(
       selectedComponents,
       availableScripts,
       accountSubdomain,
-      existingMigrationTag: existingScriptsWithMigrations.get(bundle.scriptName) ?? null,
+      existingMigrationTag: existingScriptsWithMigrations.get(bundle.scriptName)?.migrationTag ?? null,
       includeMigrations: true,
       scriptExists: existingScriptsWithMigrations.has(bundle.scriptName),
       uploadedAssets,
@@ -842,41 +900,118 @@ function dedupeReleaseOptions(options: ReleaseOption[]): ReleaseOption[] {
   return out;
 }
 
-function detectGsvInstallations(account: Account, scriptNames: string[]): ExistingGsvInstallation[] {
-  const scripts = new Set(scriptNames);
-  const instances = new Map<string, Set<string>>();
-  for (const scriptName of scripts) {
-    const match = componentForScriptName(scriptName);
-    if (!match) continue;
-    let components = instances.get(match.instance);
+type DetectableWorkerScript = {
+  id: string;
+  tags?: readonly string[];
+};
+
+type DetectedComponent = {
+  scriptName: string;
+  verified: boolean;
+};
+
+export function detectGsvInstallations(
+  account: Account,
+  workerScripts: DetectableWorkerScript[],
+): ExistingGsvInstallation[] {
+  const scripts = new Map(workerScripts.map((script) => [script.id, script]));
+  const instances = new Map<string, Map<string, DetectedComponent>>();
+
+  const addCandidate = (instance: string, component: string, script: DetectableWorkerScript): void => {
+    let components = instances.get(instance);
     if (!components) {
-      components = new Set<string>();
-      instances.set(match.instance, components);
+      components = new Map<string, DetectedComponent>();
+      instances.set(instance, components);
     }
-    components.add(match.component);
+    components.set(component, {
+      scriptName: script.id,
+      verified:
+        componentForInstallationScriptName(instance, script.id) === component &&
+        hasExpectedWorkerTags(script.tags ?? [], instance, component),
+    });
+  };
+
+  // Tags are authoritative and let us discover a named gateway even when it is
+  // the only deployed component. Names remain a read-only compatibility path
+  // for installs that predate GSV management tags.
+  for (const script of workerScripts) {
+    const identity = managedWorkerIdentity(script);
+    if (identity) addCandidate(identity.instance, identity.component, script);
+  }
+
+  for (const script of workerScripts) {
+    const match = componentForScriptName(script.id);
+    if (match) addCandidate(match.instance, match.component, script);
   }
 
   for (const instance of instances.keys()) {
-    if (scripts.has(instance)) instances.get(instance)?.add(COMPONENT_GATEWAY);
+    const gateway = scripts.get(instance);
+    if (gateway) addCandidate(instance, COMPONENT_GATEWAY, gateway);
   }
-  if (scripts.has(SCRIPT_GATEWAY)) {
-    let components = instances.get(DEFAULT_DEPLOY_INSTANCE);
-    if (!components) {
-      components = new Set<string>();
-      instances.set(DEFAULT_DEPLOY_INSTANCE, components);
-    }
-    components.add(COMPONENT_GATEWAY);
-  }
+  const defaultGateway = scripts.get(SCRIPT_GATEWAY);
+  if (defaultGateway) addCandidate(DEFAULT_DEPLOY_INSTANCE, COMPONENT_GATEWAY, defaultGateway);
 
   return [...instances]
     .filter(([, components]) => components.size > 0)
-    .map(([instance, components]) => ({
-      accountId: account.id,
-      accountName: account.name?.trim() || account.id,
-      instance,
-      components: [...components].sort((a, b) => deployOrder(a) - deployOrder(b)),
-      scriptNames: scriptNamesForDetectedInstance(instance, components).filter((name) => scripts.has(name)),
-    }));
+    .map(([instance, detected]) => {
+      const components = [...detected.keys()].sort((a, b) => deployOrder(a) - deployOrder(b));
+      return {
+        accountId: account.id,
+        accountName: account.name?.trim() || account.id,
+        instance,
+        components,
+        scriptNames: components.map((component) => detected.get(component)!.scriptName),
+        deleteSupported: [...detected.values()].every((component) => component.verified),
+      };
+    });
+}
+
+function managedWorkerIdentity(
+  script: DetectableWorkerScript,
+): { instance: string; component: string } | null {
+  const tags = script.tags ?? [];
+  if (!tags.includes(WORKER_TAG_MANAGED)) return null;
+
+  const instances = prefixedTagValues(tags, WORKER_TAG_INSTANCE_PREFIX);
+  const components = prefixedTagValues(tags, WORKER_TAG_COMPONENT_PREFIX);
+  if (instances.length !== 1 || components.length !== 1) return null;
+
+  const instance = instances[0];
+  const component = components[0];
+  if (!instance || !component || !COMPONENT_TO_BUNDLE[component]) return null;
+
+  try {
+    if (scriptNameForComponent(parseInstance(instance), component) !== script.id) return null;
+  } catch {
+    return null;
+  }
+  return { instance, component };
+}
+
+function workerTagsForComponent(instance: string, component: string): string[] {
+  return [
+    WORKER_TAG_MANAGED,
+    `${WORKER_TAG_INSTANCE_PREFIX}${instance}`,
+    `${WORKER_TAG_COMPONENT_PREFIX}${component}`,
+  ];
+}
+
+function hasExpectedWorkerTags(tags: readonly string[], instance: string, component: string): boolean {
+  const managedTags = [...new Set(tags.filter((tag) => tag.startsWith("gsv-managed-")))];
+  const instanceTags = prefixedTagValues(tags, WORKER_TAG_INSTANCE_PREFIX);
+  const componentTags = prefixedTagValues(tags, WORKER_TAG_COMPONENT_PREFIX);
+  return (
+    managedTags.length === 1 &&
+    managedTags[0] === WORKER_TAG_MANAGED &&
+    instanceTags.length === 1 &&
+    instanceTags[0] === instance &&
+    componentTags.length === 1 &&
+    componentTags[0] === component
+  );
+}
+
+function prefixedTagValues(tags: readonly string[], prefix: string): string[] {
+  return [...new Set(tags.filter((tag) => tag.startsWith(prefix)).map((tag) => tag.slice(prefix.length)))];
 }
 
 function componentForScriptName(scriptName: string): { instance: string; component: string } | null {
@@ -896,13 +1031,16 @@ function componentForScriptName(scriptName: string): { instance: string; compone
   return scriptName === SCRIPT_GATEWAY ? { instance: DEFAULT_DEPLOY_INSTANCE, component: COMPONENT_GATEWAY } : null;
 }
 
-function scriptNamesForDetectedInstance(instance: string, components: Set<string>): string[] {
+function componentForInstallationScriptName(instance: string, scriptName: string): string | null {
   const deployInstance: DeployInstance = {
     name: instance,
     isDefault: instance === DEFAULT_DEPLOY_INSTANCE,
     storageBucketName: `${instance}-storage`,
   };
-  return [...components].map((component) => scriptNameForComponent(deployInstance, component));
+  for (const component of Object.keys(COMPONENT_TO_BUNDLE)) {
+    if (scriptNameForComponent(deployInstance, component) === scriptName) return component;
+  }
+  return null;
 }
 
 function formatCount(count: number, noun: string): string {
@@ -1495,11 +1633,16 @@ async function ensureStorageResources(
   }
 }
 
-async function listWorkerScripts(accessToken: string, accountId: string): Promise<Map<string, string | null>> {
+async function listWorkerScripts(accessToken: string, accountId: string): Promise<Map<string, WorkerScriptDetails>> {
   const result = await cloudflareApi<unknown>(accessToken, `/accounts/${accountId}/workers/scripts`, {}, "List Workers scripts");
   const scripts = decodeList<WorkerScriptSummary>(result, ["scripts", "items"]);
-  const out = new Map<string, string | null>();
-  for (const script of scripts) out.set(script.id, script.migration_tag ?? null);
+  const out = new Map<string, WorkerScriptDetails>();
+  for (const script of scripts) {
+    out.set(script.id, {
+      migrationTag: script.migration_tag ?? null,
+      tags: Array.isArray(script.tags) ? script.tags.filter((tag): tag is string => typeof tag === "string") : [],
+    });
+  }
   return out;
 }
 
@@ -1733,6 +1876,7 @@ export async function buildUploadMetadata(
     main_module: bundle.entrypointPartName,
     bindings,
     compatibility_date: compatibilityDate,
+    tags: workerTagsForComponent(options.instance.name, bundle.component),
   };
 
   if (bundle.wrangler.compatibility_flags?.length) {

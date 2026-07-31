@@ -65,9 +65,20 @@ has an active Workers Paid subscription. Free accounts—and accounts whose plan
 cannot be verified—are deployed without CodeMode's Worker Loader binding or
 ripgit's paid-only CPU limit.
 
+When adding `billing.read` to an existing OAuth client, also enable that scope
+for the client in the Cloudflare dashboard. Changing `OAUTH_SCOPES` only changes
+what the installer requests; existing users must authorize again before their
+access token contains the new scope.
+
 Component compatibility comes from each release's checksum manifest. Releases
 that publish the legacy assembler bundle deploy it automatically with the
 gateway; releases without that checksum never attempt to fetch or deploy it.
+
+Every uploaded GSV Worker receives the same management-tag contract used by
+the `gsv` CLI: `gsv-managed-v1`, `gsv-instance-<name>`, and
+`gsv-component-<component>`. The overview may show older name-matched installs
+so they can be updated, but it only enables deletion when every target Worker
+has matching management tags.
 
 Set the deployed installer URL in `APP_ORIGIN`, then set secrets:
 
