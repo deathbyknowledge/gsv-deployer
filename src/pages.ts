@@ -36,7 +36,7 @@ export function homePage(repoUrl: string): string {
       <dl class="home-facts" aria-label="What deploys">
         <div><dt>Core GSV</dt><dd>Desktop, users, agents, and settings. Runs as Workers + Durable Objects.</dd></div>
         <div><dt>Storage</dt><dd>Your files, Wiki, packages, and process state, in your own R2 bucket.</dd></div>
-        <div><dt>Package builder</dt><dd>Builds and installs GSV apps you or others write.</dd></div>
+        <div><dt>CodeMode</dt><dd>Builds and installs GSV apps on Workers Paid; Free installs omit this paid-only capability.</dd></div>
         <div><dt>Channels</dt><dd>Optional. Connect WhatsApp, Discord, or Telegram to chat with GSV from anywhere.</dd></div>
       </dl>
     </div>
@@ -589,6 +589,7 @@ function displayAccount(account: Account): string {
 
 const SCOPE_LABELS: Record<string, string> = {
   "account-settings.read": "Read account settings",
+  "billing.read": "Check whether the account uses Workers Free or Paid",
   "user-details.read": "Read your user details",
   "memberships.read": "List your account memberships",
   "workers-scripts.read": "Read Worker scripts",

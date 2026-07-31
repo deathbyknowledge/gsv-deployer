@@ -71,7 +71,7 @@ const HELP_CATALOG: Record<DeployHelpCategory, Omit<DeployHelp, "category">> = {
     bucket: "bug",
     detail: "Cloudflare could not prepare storage for this GSV. Check that the account has access to the required Workers storage products.",
     whatToDo:
-      "Cloudflare couldn't create the storage this GSV needs, usually a plan limit or a name that's already in use. Confirm your account is on the Workers Paid plan with R2 enabled, then Retry. If it keeps failing, let us know.",
+      "Cloudflare couldn't create the storage this GSV needs, usually because R2 isn't enabled, a storage limit was reached, or the name is already in use. Confirm R2 is enabled, then Retry. If it keeps failing, let us know.",
   },
   workers: {
     bucket: "bug",
@@ -81,8 +81,8 @@ const HELP_CATALOG: Record<DeployHelpCategory, Omit<DeployHelp, "category">> = {
   },
   "gateway-dependency": {
     bucket: "self-fixable",
-    detail: "The gateway depends on ripgit and assembler. Select those components or deploy them first.",
-    whatToDo: "Core GSV needs Storage and Package builder alongside it. Select all three components on the deploy form, then Retry.",
+    detail: "The selected gateway release is missing a required storage or legacy assembly Worker.",
+    whatToDo: "Keep Storage selected and Retry. Legacy releases include their package-builder Worker automatically when it is available in the release.",
   },
   unknown: {
     bucket: "bug",
@@ -101,11 +101,11 @@ export function classifyDeployError(message: string): DeployHelpCategory {
   if (lower.includes("no components selected") || lower.includes("unknown component")) return "no-components";
   if (lower.includes("invalid account") || lower.includes("authentication") || lower.includes("unauthorized")) return "auth-rejected";
   if (lower.includes("forbidden") || lower.includes("permission") || lower.includes("scope")) return "permission";
+  if (lower.includes("requires ripgit") || lower.includes("requires the legacy assembler")) return "gateway-dependency";
   if (lower.includes("latest stable release") || lower.includes("no dev") || lower.includes("release")) return "release";
   if (lower.includes("checksum")) return "checksum";
   if (lower.includes("r2 bucket") || lower.includes("storage/kv") || lower.includes("kv namespace")) return "storage";
   if (lower.includes("workers/scripts") || lower.includes("upload script") || lower.includes("workers.dev")) return "workers";
-  if (lower.includes("requires ripgit") || lower.includes("requires assembler")) return "gateway-dependency";
   return "unknown";
 }
 
