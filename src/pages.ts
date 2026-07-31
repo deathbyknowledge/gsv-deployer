@@ -1,4 +1,4 @@
-import type { Account, DeployJob } from "./types";
+import type { Account, DeleteJob, DeployJob } from "./types";
 import { storageBucketNameForInstance } from "./deploy";
 import type { ExistingGsvInstallation, ReleaseOption } from "./deploy";
 import { getDeployHelp } from "./deploy-help";
@@ -209,32 +209,60 @@ export function confirmDeletePage(install: ExistingGsvInstallation): string {
   const bucketName = storageBucketNameForInstance(install.instance);
   return `<p class="eyebrow"><a href="/manage">Your GSVs</a> / <a href="/logout">Log out</a></p>
 <h1 class="page-title title-row">${cloudflareMark()} Delete ${escapeHtml(install.instance)}</h1>
-<p class="prose">Remove <strong>${escapeHtml(install.instance)}</strong> from <strong>${escapeHtml(install.accountName)}</strong>. Your files stay in R2 by default, so you can redeploy later without losing them.</p>
+<p class="prose">Permanently remove <strong>${escapeHtml(install.instance)}</strong> from <strong>${escapeHtml(install.accountName)}</strong>, including its runtime state and every stored file.</p>
 <section class="section danger-zone">
   <div class="delete-outcomes">
-    <div><span class="outcome-label remove">Will be removed</span><strong>GSV and its connected services</strong><p>The Cloudflare Workers that run this installation.</p></div>
-    <div><span class="outcome-label keep">Will be kept</span><strong>Your files and storage</strong><p>The R2 bucket <code>${escapeHtml(bucketName)}</code> and anything stored in it.</p></div>
+    <div><span class="outcome-label remove">Will be removed</span><strong>GSV services and runtime data</strong><p>The Cloudflare Workers and Durable Object data that run this installation.</p></div>
+    <div><span class="outcome-label remove">Will be removed</span><strong>All files and storage</strong><p>Every object in the R2 bucket <code>${escapeHtml(bucketName)}</code>, followed by the bucket itself.</p></div>
   </div>
+  <p class="prose"><strong>This cannot be undone.</strong> The deletion runs in the background and reports any resource Cloudflare could not remove.</p>
   <form method="post" action="/manage/delete">
     <input type="hidden" name="accountId" value="${escapeHtml(install.accountId)}">
     <input type="hidden" name="instance" value="${escapeHtml(install.instance)}">
-    <label class="check-row danger-check">
-      <input type="checkbox" name="deleteStorage" value="1">
-      <span>
-        <strong>Also remove the storage bucket if it is empty</strong>
-        <span class="hint">Cloudflare only removes an empty R2 bucket. This does not delete files; if the bucket contains anything, it will be kept.</span>
-      </span>
-    </label>
     <details class="technical-details">
       <summary>Technical details</summary>
-      <p class="hint">Worker IDs that this installer will remove:</p>
+      <p class="hint">Cloudflare Worker IDs included in this installation:</p>
       <ul class="lean-list script-list">${scripts.map((name) => `<li><code>${escapeHtml(name)}</code></li>`).join("")}</ul>
     </details>
     <div class="actions left">
-      <button class="button danger" type="submit">Delete ${escapeHtml(install.instance)}</button>
+      <button class="button danger" type="submit">Permanently delete ${escapeHtml(install.instance)}</button>
       <a class="link-button" href="/manage">Cancel</a>
     </div>
   </form>
+</section>`;
+}
+
+export function deleteJobPage(job: DeleteJob): string {
+  const progress = deletionProgressSummary(job);
+  const log = job.logs
+    .map((entry) => `[${new Date(entry.at).toISOString()}] ${entry.level.toUpperCase()} ${entry.message}`)
+    .join("\n");
+  const actions =
+    job.status === "failed"
+      ? `<form method="post" action="/delete-jobs/${escapeHtml(job.id)}/retry"><button class="button" type="submit">Retry cleanup</button></form>
+         <a class="link-button" href="/manage">Back to your GSVs</a>`
+      : job.status === "succeeded"
+        ? `<a class="button" href="/manage">Back to your GSVs</a>`
+        : `<a class="link-button" href="/manage">Back to your GSVs</a>`;
+
+  return `<p class="eyebrow"><a href="/manage">Your GSVs</a> / <a href="/logout">Log out</a></p>
+<h1 class="page-title title-row">${cloudflareMark()} Delete ${escapeHtml(job.options.instance)}</h1>
+<section class="progress-card ${progress.tone}">
+  <div class="progress-heading">
+    <span class="progress-label">${escapeHtml(progress.label)}</span>
+    <h2>${escapeHtml(progress.title)}</h2>
+  </div>
+  <p>${escapeHtml(progress.message)}</p>
+</section>
+<section class="section">
+  <ol class="step-list">${renderDeleteSteps(job)}</ol>
+</section>
+<div class="actions left">${actions}</div>
+<section class="section">
+  <details class="diagnostics"${job.status === "failed" ? " open" : ""}>
+    <summary>Deletion details</summary>
+    <pre class="log">${escapeHtml(log) || "Waiting for logs..."}</pre>
+  </details>
 </section>`;
 }
 
@@ -656,6 +684,29 @@ function renderSteps(job: DeployJob): string {
     .join("");
 }
 
+function renderDeleteSteps(job: DeleteJob): string {
+  return job.steps
+    .map((step) => {
+      const isFailed = step.status === "failed";
+      const detail = step.detail || (isFailed ? "Cloudflare did not finish this cleanup step." : "");
+      const detailBlock = detail
+        ? `<p class="step-detail${isFailed ? " step-error" : ""}">${escapeHtml(detail)}</p>`
+        : "";
+      return `<li class="step-item ${step.status}">
+  <span class="step-dot" aria-hidden="true"></span>
+  <div class="step-copy">
+    <div class="step-title-row">
+      <strong>${escapeHtml(step.title)}</strong>
+      <span class="step-status">${escapeHtml(stepStatusLabel(step.status))}</span>
+    </div>
+    <p class="hint">${escapeHtml(step.description)}</p>
+    ${detailBlock}
+  </div>
+</li>`;
+    })
+    .join("");
+}
+
 function progressSummary(job: DeployJob): {
   tone: "pending" | "running" | "success" | "warning" | "failure";
   label: string;
@@ -707,6 +758,48 @@ function progressSummary(job: DeployJob): {
     label: "Queued",
     title: "Deployment is queued",
     message: "Cloudflare is preparing to start this deployment.",
+  };
+}
+
+function deletionProgressSummary(job: DeleteJob): {
+  tone: "pending" | "running" | "success" | "failure";
+  label: string;
+  title: string;
+  message: string;
+} {
+  const completed = job.steps.filter((step) => step.status === "complete").length;
+  const running = job.steps.find((step) => step.status === "running");
+  const failed = job.steps.find((step) => step.status === "failed");
+
+  if (job.status === "failed") {
+    return {
+      tone: "failure",
+      label: "Cleanup incomplete",
+      title: failed?.title || "Deletion stopped",
+      message: failed?.detail || "Cloudflare did not finish deleting every resource. Retry cleanup after reviewing the details.",
+    };
+  }
+  if (job.status === "succeeded") {
+    return {
+      tone: "success",
+      label: "Complete",
+      title: "GSV deleted",
+      message: "Its services, Durable Object data, files, and R2 storage bucket were removed.",
+    };
+  }
+  if (running) {
+    return {
+      tone: "running",
+      label: `${completed} of ${job.steps.length} complete`,
+      title: running.title,
+      message: running.detail || running.description,
+    };
+  }
+  return {
+    tone: "pending",
+    label: "Queued",
+    title: "Deletion is queued",
+    message: "Cloudflare is preparing to remove this GSV and all of its data.",
   };
 }
 

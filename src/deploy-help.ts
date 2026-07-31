@@ -11,6 +11,7 @@ export type DeployHelpCategory =
   | "no-components"
   | "auth-rejected"
   | "permission"
+  | "unsupported-release"
   | "release"
   | "checksum"
   | "storage"
@@ -57,6 +58,11 @@ const HELP_CATALOG: Record<DeployHelpCategory, Omit<DeployHelp, "category">> = {
     whatToDo:
       "Make sure your Cloudflare account has Workers, R2, and KV enabled on its plan, then Retry. You may need to reauthorize and approve the requested permissions.",
   },
+  "unsupported-release": {
+    bucket: "self-fixable",
+    detail: "This older GSV release is not supported by the current installer because it does not contain the complete stack.",
+    whatToDo: "Return to the deploy form, choose Latest stable, and try again.",
+  },
   release: {
     bucket: "self-fixable",
     detail: "The selected GSV release is not available. Try the stable channel, the dev channel, or a specific release tag.",
@@ -102,6 +108,7 @@ export function classifyDeployError(message: string): DeployHelpCategory {
   if (lower.includes("invalid account") || lower.includes("authentication") || lower.includes("unauthorized")) return "auth-rejected";
   if (lower.includes("forbidden") || lower.includes("permission") || lower.includes("scope")) return "permission";
   if (lower.includes("requires ripgit") || lower.includes("requires the legacy assembler")) return "gateway-dependency";
+  if (lower.includes("unsupported gsv release")) return "unsupported-release";
   if (lower.includes("latest stable release") || lower.includes("no dev") || lower.includes("release")) return "release";
   if (lower.includes("checksum")) return "checksum";
   if (lower.includes("r2 bucket") || lower.includes("storage/kv") || lower.includes("kv namespace")) return "storage";

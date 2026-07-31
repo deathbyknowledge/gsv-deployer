@@ -31,6 +31,16 @@ describe("free deployment copy", () => {
     expect(dependencyHelp.whatToDo).toContain("Legacy releases");
   });
 
+  it("directs unsupported historical releases to latest stable", () => {
+    const help = getDeployHelp(
+      "Unsupported GSV release: the release does not include the complete stack (missing.tar.gz). Choose Latest stable and try again.",
+    );
+
+    expect(help.category).toBe("unsupported-release");
+    expect(help.detail).toContain("older GSV release");
+    expect(help.whatToDo).toContain("Latest stable");
+  });
+
   it("keeps internal Worker components out of deployment choices", () => {
     const create = deployPage(
       [{ id: "account-id", name: "Account" }],
@@ -121,7 +131,7 @@ describe("free deployment copy", () => {
     expect(overview).not.toContain("<li class=\"manage-card\"");
   });
 
-  it("summarizes deletion outcomes before showing Worker IDs", () => {
+  it("makes full data deletion explicit before showing technical IDs", () => {
     const confirmation = confirmDeletePage({
       accountId: "account-id",
       accountName: "Account",
@@ -131,11 +141,14 @@ describe("free deployment copy", () => {
       deleteSupported: true,
     });
 
-    expect(confirmation).toContain("GSV and its connected services");
-    expect(confirmation).toContain("Your files and storage");
+    expect(confirmation).toContain("GSV services and runtime data");
+    expect(confirmation).toContain("Durable Object data");
+    expect(confirmation).toContain("All files and storage");
+    expect(confirmation).toContain("This cannot be undone");
     expect(confirmation).toContain("Technical details");
     expect(confirmation.indexOf("Technical details")).toBeLessThan(confirmation.indexOf("ripgit"));
-    expect(confirmation).toContain("This does not delete files");
+    expect(confirmation).not.toContain('name="deleteStorage"');
+    expect(confirmation).not.toContain("Will be kept");
   });
 
   it("keeps name-matched installations unverified when management tags are absent", () => {

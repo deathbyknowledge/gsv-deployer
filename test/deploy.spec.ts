@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ALL_COMPONENTS,
+  adapterConfigurationOutcome,
   buildUploadMetadata,
   completeDeployOptions,
-  deleteGsvInstallation,
+  deleteGsvWorkers,
+  deleteR2ObjectsBatch,
   detectGsvInstallations,
   resolveReleaseComponents,
   workersPaidFromSubscriptions,
@@ -46,8 +48,17 @@ describe("deployment compatibility", () => {
     ]);
 
     expect(() => resolveReleaseComponents(["gateway"], new Map())).toThrow(
-      "Missing checksum entry for gsv-cloudflare-gateway.tar.gz.",
+      "Unsupported GSV release: the release does not include the complete stack (gsv-cloudflare-gateway.tar.gz). Choose Latest stable and try again.",
     );
+  });
+
+  it("warns when Telegram cannot receive a webhook URL", () => {
+    expect(adapterConfigurationOutcome(["channel-telegram"], null, 0)).toEqual({
+      status: "warning",
+      detail:
+        "Messaging channels are installed and can be connected later in GSV. Telegram's webhook URL could not be configured because the workers.dev subdomain was unavailable.",
+    });
+    expect(adapterConfigurationOutcome(["channel-telegram"], "example", 1).status).toBe("complete");
   });
 
   it("adds paid Worker features only for verified paid accounts", async () => {
@@ -173,7 +184,7 @@ describe("deployment compatibility", () => {
     ]);
   });
 
-  it("keeps storage when any Worker deletion fails", async () => {
+  it("leaves storage cleanup to a later phase when any Worker deletion fails", async () => {
     const requests: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -196,7 +207,7 @@ describe("deployment compatibility", () => {
       throw new Error(`Unexpected request: ${method} ${url}`);
     }));
 
-    const result = await deleteGsvInstallation(
+    const result = await deleteGsvWorkers(
       "access-token",
       {
         accountId: "account-id",
@@ -206,11 +217,9 @@ describe("deployment compatibility", () => {
         scriptNames: ["ripgit", "gsv"],
         deleteSupported: true,
       },
-      { deleteStorage: true },
     );
 
     expect(result.failed).toEqual([expect.objectContaining({ script: "gsv" })]);
-    expect(result.storage).toBeUndefined();
     expect(requests.some((request) => request.includes("/r2/buckets/"))).toBe(false);
   });
 
@@ -228,7 +237,7 @@ describe("deployment compatibility", () => {
       throw new Error(`Unexpected request: ${method} ${url}`);
     }));
 
-    const result = await deleteGsvInstallation("access-token", {
+    const result = await deleteGsvWorkers("access-token", {
       accountId: "account-id",
       accountName: "Account",
       instance: "gsv",
@@ -240,6 +249,37 @@ describe("deployment compatibility", () => {
     expect(result.deleted).toEqual([]);
     expect(result.failed[0]?.error).toContain("ownership changed");
     expect(requests.every((request) => request.startsWith("GET "))).toBe(true);
+  });
+
+  it("deletes R2 object batches while preserving slashes in object keys", async () => {
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      requests.push(`${method} ${url}`);
+      if (method === "GET") {
+        return cloudflareResponse([{ key: "folder/a file#1.txt" }, { key: "root.txt" }]);
+      }
+      if (method === "DELETE") return cloudflareResponse({ key: "deleted" });
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    }));
+
+    const result = await deleteR2ObjectsBatch("access-token", "account-id", "gsv-storage");
+
+    expect(result).toEqual({ bucketMissing: false, deleted: 2, empty: false });
+    expect(requests).toContain(
+      "DELETE https://api.cloudflare.com/client/v4/accounts/account-id/r2/buckets/gsv-storage/objects/folder/a%20file%231.txt",
+    );
+  });
+
+  it("treats an already-removed R2 bucket as empty", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("not found", { status: 404 })));
+
+    await expect(deleteR2ObjectsBatch("access-token", "account-id", "gsv-storage")).resolves.toEqual({
+      bucketMissing: true,
+      deleted: 0,
+      empty: true,
+    });
   });
 });
 

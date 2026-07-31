@@ -1,25 +1,38 @@
 import { Hono, type Context } from "hono";
 
-export { GsvDeployWorkflow } from "./workflow";
+export { GsvDeleteWorkflow, GsvDeployWorkflow } from "./workflow";
 export { DeployJobState } from "./deploy-job";
 
-import { completeDeployOptions, deleteGsvInstallation, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
+import { completeDeployOptions, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
 import type { ExistingGsvInstallation } from "./deploy";
 import departureMonoWoff2 from "./assets/departure-mono.woff2";
 import { ANALYTICS_SCRIPT } from "./analytics";
 import {
   appendLog,
+  createDeleteJob,
   createJob,
+  getDeleteJob,
   getJob,
   JOB_TTL_SECONDS,
   markJobStartFailure,
+  markDeleteJobStartFailure,
   toPublicDeployJob,
   verifyJobViewToken,
 } from "./jobs";
 import { getCookie, setCookie } from "./cookies";
 import { page } from "./html";
 import { fetchAccounts, getSessionWithId, handleCallback, logout, requireSession, startLogin } from "./oauth";
-import { confirmDeletePage, deployPage, errorPage, homePage, jobPage, managePage, metricsPage, noAccountsPage } from "./pages";
+import {
+  confirmDeletePage,
+  deleteJobPage,
+  deployPage,
+  errorPage,
+  homePage,
+  jobPage,
+  managePage,
+  metricsPage,
+  noAccountsPage,
+} from "./pages";
 import type { DeployPrefill } from "./pages";
 import {
   fetchGsvSiteDaily,
@@ -33,7 +46,7 @@ import {
   trackRequestEvent,
 } from "./metrics";
 import { fetchDailyHistory, fetchDeployTotals, fetchInstallList, rollupHistory } from "./history";
-import type { Account, AppEnv, DeployJob, DeployOptions } from "./types";
+import type { Account, AppEnv, DeleteJob, DeleteOptions, DeployJob, DeployOptions } from "./types";
 
 const app = new Hono<AppEnv>();
 const PREVIEW_ACCOUNTS: Account[] = [
@@ -169,30 +182,63 @@ app.post("/manage/delete", async (c) => {
   const install = installations.find((item) => item.accountId === accountId && item.instance === instance);
   if (!install || !install.deleteSupported) return c.redirect("/manage");
 
-  const deleteStorage = stringField(form, "deleteStorage") === "1";
-  const result = await deleteGsvInstallation(session.session.token.access_token, install, { deleteStorage });
-  if (result.failed.length > 0) {
-    const scripts = result.failed.map((entry) => entry.script).join(", ");
+  return queueDeletion(c, session, {
+    accountId: install.accountId,
+    accountName: install.accountName,
+    instance: install.instance,
+    scriptNames: install.scriptNames,
+  });
+});
+
+app.get("/delete-jobs/:id", async (c) => {
+  const job = await getDeleteJob(c.env, c.req.param("id"));
+  if (!job) {
     return page(c, {
-      title: "Delete failed",
-      body: errorPage(
-        "Could not fully delete",
-        `Some Workers for ${install.instance} could not be deleted (${scripts}): ${result.failed[0].error}. Any remaining Workers are shown back on your GSVs overview.`,
-      ),
-      status: 502,
+      title: "Not Found",
+      body: errorPage("Not Found", "Deletion job was not found."),
+      status: 404,
     });
   }
-  if (result.storage && !result.storage.deleted) {
+
+  const current = await getSessionWithId(c);
+  const canView = await canViewJob(c.req.raw, job, current?.sessionId);
+  if (!canView) {
+    if (!current) return redirectToLogin(c);
     return page(c, {
-      title: "Storage not deleted",
-      body: errorPage(
-        "Workers deleted, storage kept",
-        `The Workers for ${install.instance} were deleted, but the R2 bucket ${result.storage.name} could not be removed: ${result.storage.error}. If it still contains files, empty it in the Cloudflare dashboard and delete the bucket there.`,
-      ),
-      status: 502,
+      title: "Not Found",
+      body: errorPage("Not Found", "Deletion job was not found."),
+      status: 404,
     });
   }
-  return c.redirect("/manage");
+
+  return page(c, {
+    title: `Delete ${job.options.instance}`,
+    body: deleteJobPage(job),
+    width: "wide",
+    refreshSeconds: job.status === "queued" || job.status === "running" ? 4 : undefined,
+  });
+});
+
+app.post("/delete-jobs/:id/retry", async (c) => {
+  let current;
+  try {
+    current = await requireSession(c);
+  } catch {
+    return redirectToLogin(c);
+  }
+
+  const previous = await getDeleteJob(c.env, c.req.param("id"));
+  if (!previous || previous.sessionId !== current.sessionId || previous.status !== "failed") {
+    return c.redirect("/manage");
+  }
+  const accounts = await fetchAccounts(current.session.token.access_token);
+  const account = accounts.find((item) => item.id === previous.options.accountId);
+  if (!account) return c.redirect("/manage");
+
+  return queueDeletion(c, current, {
+    ...previous.options,
+    accountName: account.name,
+  });
 });
 
 app.get("/deploy", async (c) => {
@@ -583,6 +629,7 @@ app.get("/robots.txt", (c) =>
       "Disallow: /oauth/",
       "Disallow: /deploy",
       "Disallow: /jobs/",
+      "Disallow: /delete-jobs/",
       "Disallow: /api/",
       "Disallow: /metrics",
       "Allow: /",
@@ -611,6 +658,49 @@ app.notFound((c) =>
   }),
 );
 
+async function queueDeletion(
+  c: Context<AppEnv>,
+  current: Awaited<ReturnType<typeof requireSession>>,
+  options: DeleteOptions,
+): Promise<Response> {
+  const { job, viewToken } = await createDeleteJob(c.env, {
+    sessionId: current.sessionId,
+    options,
+    token: current.session.token,
+    tokenIssuedAt: sessionCreatedAtMs(current.session.createdAt),
+  });
+  try {
+    const instance = await c.env.DELETE_WORKFLOW.create({
+      id: job.id,
+      params: { jobId: job.id, pass: 0 },
+      retention: {
+        successRetention: "1 day",
+        errorRetention: "7 days",
+      },
+    });
+    try {
+      await appendLog(c.env, job.id, "info", `Started deletion workflow ${instance.id}.`);
+    } catch (error) {
+      console.error(JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+        jobId: job.id,
+        message: "Could not append deletion workflow startup diagnostic",
+      }));
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await markDeleteJobStartFailure(
+      c.env,
+      job.id,
+      "The deletion workflow could not start. Retry cleanup in a moment.",
+      message,
+    );
+  }
+  return redirectWithCookies(`/delete-jobs/${job.id}`, [
+    setCookie(jobViewCookieName(job.id), viewToken, JOB_TTL_SECONDS),
+  ]);
+}
+
 function stringField(form: FormData, name: string): string {
   const value = form.get(name);
   return typeof value === "string" ? value.trim() : "";
@@ -635,7 +725,7 @@ function parseExistingTarget(value: string): { accountId: string; instance: stri
   return accountId && instance ? { accountId, instance } : null;
 }
 
-async function canViewJob(request: Request, job: DeployJob, sessionId?: string): Promise<boolean> {
+async function canViewJob(request: Request, job: DeployJob | DeleteJob, sessionId?: string): Promise<boolean> {
   if (sessionId && job.sessionId === sessionId) return true;
   return verifyJobViewToken(job, getCookie(request, jobViewCookieName(job.id)));
 }

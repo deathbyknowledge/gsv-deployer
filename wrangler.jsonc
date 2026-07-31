@@ -68,6 +68,14 @@
 			"limits": {
 				"steps": 100
 			}
+		},
+		{
+			"name": "gsv-deletion-workflow",
+			"binding": "DELETE_WORKFLOW",
+			"class_name": "GsvDeleteWorkflow",
+			"limits": {
+				"steps": 1024
+			}
 		}
 	],
 	"vars": {

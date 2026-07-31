@@ -38,6 +38,8 @@ const WORKER_TAG_INSTANCE_PREFIX = "gsv-instance-";
 const WORKER_TAG_COMPONENT_PREFIX = "gsv-component-";
 const WORKERS_SUBDOMAIN_API_DATE = "2025-08-01";
 const MAX_SOURCE_MAP_UPLOAD_BYTES = 2 * 1024 * 1024;
+const R2_DELETE_BATCH_SIZE = 32;
+const R2_DELETE_CONCURRENCY = 6;
 const DEPLOY_WORKFLOW_STEP_CONFIG = {
   timeout: "30 minutes",
   retries: { limit: 2, delay: "30 seconds", backoff: "linear" },
@@ -348,15 +350,15 @@ export async function findExistingGsvInstallations(
   });
 }
 
-export type DeleteInstallationResult = {
+export type DeleteWorkersResult = {
   deleted: string[];
   failed: Array<{ script: string; error: string }>;
-  storage?: { name: string; deleted: boolean; error?: string };
 };
 
-export type DeleteInstallationOptions = {
-  /** When true, also remove the install's R2 storage bucket if it is empty. */
-  deleteStorage?: boolean;
+export type DeleteR2ObjectsBatchResult = {
+  bucketMissing: boolean;
+  deleted: number;
+  empty: boolean;
 };
 
 export function storageBucketNameForInstance(instance: string): string {
@@ -364,20 +366,15 @@ export function storageBucketNameForInstance(instance: string): string {
 }
 
 /**
- * Removes the Worker scripts that make up a detected GSV install. Scripts are
- * deleted with force=true so service bindings and Durable Object namespaces
- * between components don't block removal.
- *
- * By default the R2 storage bucket and its data are left untouched so the
- * install can be redeployed later without losing files. Pass `deleteStorage` to
- * also remove the bucket when it is already empty; Cloudflare rejects deletion
- * for buckets that still contain objects.
+ * Removes the Worker scripts that make up a verified GSV install. `force=true`
+ * is intentional: deleting a GSV also deletes the Durable Object namespaces and
+ * runtime data owned by those scripts. R2 cleanup happens only after this phase
+ * succeeds, so a partial Worker failure cannot erase the installation's files.
  */
-export async function deleteGsvInstallation(
+export async function deleteGsvWorkers(
   accessToken: string,
   installation: ExistingGsvInstallation,
-  options: DeleteInstallationOptions = {},
-): Promise<DeleteInstallationResult> {
+): Promise<DeleteWorkersResult> {
   if (!installation.deleteSupported) {
     return refusedDeletionResult(
       installation,
@@ -423,23 +420,13 @@ export async function deleteGsvInstallation(
     }
   }
 
-  const result: DeleteInstallationResult = { deleted, failed };
-  if (options.deleteStorage && failed.length === 0) {
-    const bucketName = storageBucketNameForInstance(installation.instance);
-    try {
-      await deleteR2Bucket(accessToken, installation.accountId, bucketName);
-      result.storage = { name: bucketName, deleted: true };
-    } catch (error) {
-      result.storage = { name: bucketName, deleted: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-  return result;
+  return { deleted, failed };
 }
 
 function refusedDeletionResult(
   installation: ExistingGsvInstallation,
   error: string,
-): DeleteInstallationResult {
+): DeleteWorkersResult {
   const scripts = installation.scriptNames.length > 0 ? installation.scriptNames : [installation.instance];
   return {
     deleted: [],
@@ -447,7 +434,34 @@ function refusedDeletionResult(
   };
 }
 
-async function deleteR2Bucket(accessToken: string, accountId: string, bucketName: string): Promise<void> {
+export async function deleteR2ObjectsBatch(
+  accessToken: string,
+  accountId: string,
+  bucketName: string,
+): Promise<DeleteR2ObjectsBatchResult> {
+  const response = await cloudflareRaw(
+    accessToken,
+    `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}/objects?per_page=${R2_DELETE_BATCH_SIZE}`,
+  );
+  if (response.status === 404) return { bucketMissing: true, deleted: 0, empty: true };
+
+  const objects = await parseCloudflareEnvelope<Array<{ key?: string }>>(response, `List R2 objects in ${bucketName}`);
+  const keys = objects.map((object) => object.key);
+  if (keys.some((key) => typeof key !== "string")) {
+    throw new Error(`List R2 objects in ${bucketName} returned an object without a key.`);
+  }
+  const objectKeys = keys as string[];
+  for (let index = 0; index < objectKeys.length; index += R2_DELETE_CONCURRENCY) {
+    await Promise.all(
+      objectKeys
+        .slice(index, index + R2_DELETE_CONCURRENCY)
+        .map((key) => deleteR2Object(accessToken, accountId, bucketName, key)),
+    );
+  }
+  return { bucketMissing: false, deleted: objectKeys.length, empty: objectKeys.length === 0 };
+}
+
+export async function deleteR2Bucket(accessToken: string, accountId: string, bucketName: string): Promise<void> {
   const response = await cloudflareRaw(
     accessToken,
     `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}`,
@@ -456,6 +470,27 @@ async function deleteR2Bucket(accessToken: string, accountId: string, bucketName
   // A bucket that is already gone is a success from the caller's perspective.
   if (response.status === 404) return;
   await parseCloudflareEnvelope(response, `Delete R2 bucket ${bucketName}`);
+}
+
+async function deleteR2Object(
+  accessToken: string,
+  accountId: string,
+  bucketName: string,
+  objectKey: string,
+): Promise<void> {
+  const response = await cloudflareRaw(
+    accessToken,
+    `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}/objects/${encodeR2ObjectKey(objectKey)}`,
+    { method: "DELETE" },
+  );
+  if (response.status === 404) return;
+  await parseCloudflareEnvelope(response, `Delete R2 object from ${bucketName}`);
+}
+
+function encodeR2ObjectKey(key: string): string {
+  // Cloudflare's R2 REST API requires path separators in object keys to stay
+  // literal while all other reserved characters remain percent-encoded.
+  return key.split("/").map((segment) => encodeURIComponent(segment)).join("/");
 }
 
 async function deleteWorkerScript(accessToken: string, accountId: string, scriptName: string): Promise<void> {
@@ -778,12 +813,11 @@ async function configureAdaptersAndFinish(
     configuredChannels += 1;
   }
   if (hasChannelComponents) {
+    const outcome = adapterConfigurationOutcome([...selectedComponents], accountSubdomain, configuredChannels);
     await logger.step(
       "adapters",
-      "complete",
-      configuredChannels > 0
-        ? "Provided channel credentials are configured. Other channels can be connected later in GSV."
-        : "Messaging channels are installed and can be connected later in GSV.",
+      outcome.status,
+      outcome.detail,
     );
   }
 
@@ -804,6 +838,24 @@ async function configureAdaptersAndFinish(
   );
 
   return { version: plan.version, gatewayUrl };
+}
+
+export function adapterConfigurationOutcome(
+  selectedComponents: readonly string[],
+  accountSubdomain: string | null,
+  configuredChannels: number,
+): { status: "complete" | "warning"; detail: string } {
+  const detail =
+    configuredChannels > 0
+      ? "Provided channel credentials are configured. Other channels can be connected later in GSV."
+      : "Messaging channels are installed and can be connected later in GSV.";
+  if (selectedComponents.includes(COMPONENT_CHANNEL_TELEGRAM) && !accountSubdomain) {
+    return {
+      status: "warning",
+      detail: `${detail} Telegram's webhook URL could not be configured because the workers.dev subdomain was unavailable.`,
+    };
+  }
+  return { status: "complete", detail };
 }
 
 async function prepareBundlesForPhase(
@@ -873,14 +925,20 @@ export function resolveReleaseComponents(
   checksums: ReadonlyMap<string, string>,
 ): string[] {
   const resolved = new Set<string>();
+  const missingBundles: string[] = [];
   for (const component of requestedComponents) {
     const bundleFile = COMPONENT_TO_BUNDLE[component];
     if (!bundleFile) throw new Error(`Unknown component: ${component}`);
     if (checksums.has(bundleFile)) {
       resolved.add(component);
     } else if (component !== LEGACY_COMPONENT_ASSEMBLER) {
-      throw new Error(`Missing checksum entry for ${bundleFile}.`);
+      missingBundles.push(bundleFile);
     }
+  }
+  if (missingBundles.length > 0) {
+    throw new Error(
+      `Unsupported GSV release: the release does not include the complete stack (${missingBundles.join(", ")}). Choose Latest stable and try again.`,
+    );
   }
 
   const assemblerBundle = COMPONENT_TO_BUNDLE[LEGACY_COMPONENT_ASSEMBLER];

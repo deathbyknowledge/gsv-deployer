@@ -2,6 +2,9 @@ import { DurableObject } from "cloudflare:workers";
 
 import type {
   AppEnv,
+  DeleteJob,
+  DeleteStep,
+  DeleteStepId,
   DeployCredentialRecord,
   DeployJob,
   DeployStep,
@@ -27,10 +30,21 @@ type ReadState<T> = {
 
 export class DeployJobState extends DurableObject<AppEnv["Bindings"]> {
   async initialize(job: DeployJob, credentials: DeployCredentialRecord | null): Promise<void> {
+    await this.initializeRecord(job, credentials);
+  }
+
+  async initializeDeletion(job: DeleteJob, credentials: DeployCredentialRecord | null): Promise<void> {
+    await this.initializeRecord(job, credentials);
+  }
+
+  private async initializeRecord(
+    job: DeployJob | DeleteJob,
+    credentials: DeployCredentialRecord | null,
+  ): Promise<void> {
     const now = Date.now();
     this.ctx.storage.transactionSync(() => {
-      const existing = this.readLiveState<DeployJob>(JOB_STATE_KEY, now);
-      if (existing.value) throw new Error(`Deployment job ${job.id} already exists.`);
+      const existing = this.readLiveState<DeployJob | DeleteJob>(JOB_STATE_KEY, now);
+      if (existing.value) throw new Error(`Job ${job.id} already exists.`);
 
       this.writeState(JOB_STATE_KEY, job, now + JOB_TTL_SECONDS * 1000);
       this.ctx.storage.kv.delete(CREDENTIAL_STATE_KEY);
@@ -46,17 +60,23 @@ export class DeployJobState extends DurableObject<AppEnv["Bindings"]> {
   }
 
   async getJob(): Promise<DeployJob | null> {
-    const state = this.readLiveState<DeployJob>(JOB_STATE_KEY);
+    const state = this.readLiveState<DeployJob | DeleteJob>(JOB_STATE_KEY);
     if (state.expired) await this.scheduleExpiration();
-    return state.value;
+    return state.value && !isDeleteJob(state.value) ? state.value : null;
+  }
+
+  async getDeletion(): Promise<DeleteJob | null> {
+    const state = this.readLiveState<DeployJob | DeleteJob>(JOB_STATE_KEY);
+    if (state.expired) await this.scheduleExpiration();
+    return state.value && isDeleteJob(state.value) ? state.value : null;
   }
 
   async mergeJob(pending: DeployJob): Promise<DeployJob> {
     const now = Date.now();
     let merged: DeployJob | null = null;
     this.ctx.storage.transactionSync(() => {
-      const current = this.readLiveState<DeployJob>(JOB_STATE_KEY, now).value;
-      if (!current) throw new Error(`Deployment job ${pending.id} was not found.`);
+      const current = this.readLiveState<DeployJob | DeleteJob>(JOB_STATE_KEY, now).value;
+      if (!current || isDeleteJob(current)) throw new Error(`Deployment job ${pending.id} was not found.`);
 
       merged = mergeJobForSave(current, pending);
       merged.updatedAt = now;
@@ -67,10 +87,26 @@ export class DeployJobState extends DurableObject<AppEnv["Bindings"]> {
     return merged;
   }
 
+  async mergeDeletion(pending: DeleteJob): Promise<DeleteJob> {
+    const now = Date.now();
+    let merged: DeleteJob | null = null;
+    this.ctx.storage.transactionSync(() => {
+      const current = this.readLiveState<DeployJob | DeleteJob>(JOB_STATE_KEY, now).value;
+      if (!current || !isDeleteJob(current)) throw new Error(`Deletion job ${pending.id} was not found.`);
+
+      merged = mergeJobForSave(current, pending);
+      merged.updatedAt = now;
+      this.writeState(JOB_STATE_KEY, merged, now + JOB_TTL_SECONDS * 1000);
+    });
+    await this.scheduleExpiration();
+    if (!merged) throw new Error(`Deletion job ${pending.id} was not found.`);
+    return merged;
+  }
+
   async appendLog(level: "info" | "warning" | "error", message: string): Promise<void> {
     const now = Date.now();
     this.ctx.storage.transactionSync(() => {
-      const job = this.requireJob(now);
+      const job = this.requireRecord(now);
       appendLogToJob(job, level, message, now);
       job.updatedAt = now;
       this.writeState(JOB_STATE_KEY, job, now + JOB_TTL_SECONDS * 1000);
@@ -93,6 +129,21 @@ export class DeployJobState extends DurableObject<AppEnv["Bindings"]> {
     await this.scheduleExpiration();
   }
 
+  async failDeletionWorkflowStart(detail: string, message: string): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      const job = this.requireDeletion(now);
+      failActiveStepOnJob(job, detail, now);
+      appendLogToJob(job, "error", `Failed to start deletion workflow: ${message}`, now);
+      job.status = "failed";
+      job.error = message;
+      job.updatedAt = now;
+      this.writeState(JOB_STATE_KEY, job, now + JOB_TTL_SECONDS * 1000);
+      this.ctx.storage.kv.delete(CREDENTIAL_STATE_KEY);
+    });
+    await this.scheduleExpiration();
+  }
+
   async getCredentials(): Promise<DeployCredentialRecord | null> {
     const state = this.readLiveState<DeployCredentialRecord>(CREDENTIAL_STATE_KEY);
     if (state.expired) await this.scheduleExpiration();
@@ -102,7 +153,7 @@ export class DeployJobState extends DurableObject<AppEnv["Bindings"]> {
   async setCredentials(credentials: DeployCredentialRecord): Promise<void> {
     const now = Date.now();
     this.ctx.storage.transactionSync(() => {
-      this.requireJob(now);
+      this.requireRecord(now);
       this.writeState(
         CREDENTIAL_STATE_KEY,
         credentials,
@@ -123,8 +174,20 @@ export class DeployJobState extends DurableObject<AppEnv["Bindings"]> {
   }
 
   private requireJob(now: number): DeployJob {
-    const job = this.readLiveState<DeployJob>(JOB_STATE_KEY, now).value;
-    if (!job) throw new Error("Deployment job was not found.");
+    const job = this.requireRecord(now);
+    if (isDeleteJob(job)) throw new Error("Deployment job was not found.");
+    return job;
+  }
+
+  private requireDeletion(now: number): DeleteJob {
+    const job = this.requireRecord(now);
+    if (!isDeleteJob(job)) throw new Error("Deletion job was not found.");
+    return job;
+  }
+
+  private requireRecord(now: number): DeployJob | DeleteJob {
+    const job = this.readLiveState<DeployJob | DeleteJob>(JOB_STATE_KEY, now).value;
+    if (!job) throw new Error("Job was not found.");
     return job;
   }
 
@@ -169,7 +232,7 @@ export class DeployJobState extends DurableObject<AppEnv["Bindings"]> {
 }
 
 export function appendLogToJob(
-  job: DeployJob,
+  job: DeployJob | DeleteJob,
   level: "info" | "warning" | "error",
   message: string,
   now = Date.now(),
@@ -192,7 +255,17 @@ export function updateStepOnJob(
   if (detail !== undefined) step.detail = detail;
 }
 
-export function failActiveStepOnJob(job: DeployJob, detail: string, now = Date.now()): void {
+export function updateDeleteStepOnJob(
+  job: DeleteJob,
+  stepId: DeleteStepId,
+  status: DeployStepStatus,
+  detail?: string,
+  now = Date.now(),
+): void {
+  updateStep(job.steps, stepId, status, detail, now);
+}
+
+export function failActiveStepOnJob(job: DeployJob | DeleteJob, detail: string, now = Date.now()): void {
   const running = job.steps.find((step) => step.status === "running");
   const target = running ?? job.steps.find((step) => step.status === "pending") ?? job.steps.at(-1);
   if (!target) return;
@@ -201,16 +274,16 @@ export function failActiveStepOnJob(job: DeployJob, detail: string, now = Date.n
   target.updatedAt = now;
 }
 
-function mergeJobForSave(latest: DeployJob, pending: DeployJob): DeployJob {
+function mergeJobForSave<T extends DeployJob | DeleteJob>(latest: T, pending: T): T {
   return {
     ...latest,
     ...pending,
     steps: mergeSteps(latest.steps, pending.steps),
     logs: mergeLogs(latest.logs, pending.logs),
-  };
+  } as T;
 }
 
-function mergeSteps(latest: DeployStep[], pending: DeployStep[]): DeployStep[] {
+function mergeSteps<T extends DeployStep | DeleteStep>(latest: T[], pending: T[]): T[] {
   const latestById = new Map(latest.map((step) => [step.id, step]));
   const merged = pending.map((step) => {
     const current = latestById.get(step.id);
@@ -246,4 +319,22 @@ function isExpiringState(value: unknown): value is ExpiringState<unknown> {
     typeof value.expiresAt === "number" &&
     Number.isFinite(value.expiresAt)
   );
+}
+
+function updateStep<T extends DeployStep | DeleteStep>(
+  steps: T[],
+  stepId: T["id"],
+  status: DeployStepStatus,
+  detail: string | undefined,
+  now: number,
+): void {
+  const step = steps.find((item) => item.id === stepId);
+  if (!step) return;
+  step.status = status;
+  step.updatedAt = now;
+  if (detail !== undefined) step.detail = detail;
+}
+
+function isDeleteJob(job: DeployJob | DeleteJob): job is DeleteJob {
+  return "kind" in job && job.kind === "delete";
 }

@@ -25,6 +25,7 @@ export type AppEnv = {
     RELEASE_CACHE: R2Bucket;
     DEPLOY_JOBS: DurableObjectNamespace<DeployJobState>;
     DEPLOY_WORKFLOW: Workflow<DeployWorkflowParams>;
+    DELETE_WORKFLOW: Workflow<DeleteWorkflowParams>;
     METRICS: AnalyticsEngineDataset;
     // Durable daily rollups of Analytics Engine data so history survives past AE's
     // ~90-day retention window. Populated by the nightly scheduled handler.
@@ -61,12 +62,21 @@ export type DeployStepId =
   | "adapters"
   | "finish";
 
+export type DeleteStepId = "authorize" | "workers" | "storage" | "finish";
+
 export type DeployOptions = {
   accountId: string;
   accountName?: string;
   instance: string;
   version: string;
   components: string[];
+};
+
+export type DeleteOptions = {
+  accountId: string;
+  accountName?: string;
+  instance: string;
+  scriptNames: string[];
 };
 
 export type DeployAdapterSecrets = {
@@ -93,6 +103,15 @@ export type DeployStep = {
   updatedAt?: number;
 };
 
+export type DeleteStep = {
+  id: DeleteStepId;
+  title: string;
+  description: string;
+  status: DeployStepStatus;
+  detail?: string;
+  updatedAt?: number;
+};
+
 export type DeployJob = {
   id: string;
   sessionId: string;
@@ -112,6 +131,31 @@ export type DeployJob = {
 
 export type PublicDeployJob = Omit<DeployJob, "sessionId" | "viewTokenHash">;
 
+export type DeleteJob = {
+  kind: "delete";
+  id: string;
+  sessionId: string;
+  viewTokenHash?: string;
+  status: DeployStatus;
+  createdAt: number;
+  updatedAt: number;
+  options: DeleteOptions;
+  steps: DeleteStep[];
+  logs: Array<{ at: number; level: "info" | "warning" | "error"; message: string }>;
+  result?: {
+    bucketName: string;
+    deletedWorkers: number;
+  };
+  error?: string;
+};
+
+export type PublicDeleteJob = Omit<DeleteJob, "sessionId" | "viewTokenHash">;
+
 export type DeployWorkflowParams = {
   jobId: string;
+};
+
+export type DeleteWorkflowParams = {
+  jobId: string;
+  pass: number;
 };
