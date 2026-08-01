@@ -86,7 +86,7 @@
 		"GSV_REPO_NAME": "gsv",
 		"GITHUB_REPO_URL": "https://github.com/deathbyknowledge/gsv",
 		"INTERNAL_ACCOUNT_IDS": "f7c938a773193df3a4ac230b24bc8259,Humans and Machines",
-		"OAUTH_SCOPES": "account-settings.read billing.read user-details.read memberships.read workers-scripts.read workers-scripts.write workers-r2.read workers-r2.write workers-kv-storage.read workers-kv-storage.write ai.write",
+		"OAUTH_SCOPES": "account-settings.read user-details.read memberships.read workers-scripts.read workers-scripts.write workers-r2.read workers-r2.write workers-kv-storage.read workers-kv-storage.write ai.write",
 		"OAUTH_TOKEN_AUTH_METHOD": "client_secret_post"
 	},
 	"secrets": {

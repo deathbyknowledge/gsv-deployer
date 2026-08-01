@@ -201,12 +201,8 @@ type WorkerScriptDetails = {
   tags: string[];
 };
 
-type CloudflareSubscription = {
-  rate_plan?: {
-    id?: string;
-    scope?: string;
-  };
-  state?: string;
+type WorkersAccountSettings = {
+  default_usage_model?: string;
 };
 
 type AssetsUploadSessionResponse = {
@@ -1708,17 +1704,8 @@ async function listWorkerScripts(accessToken: string, accountId: string): Promis
   return out;
 }
 
-function subscriptionIsActive(state: string | undefined): boolean {
-  const normalized = state?.trim().toLowerCase();
-  return normalized === "trial" || normalized === "provisioned" || normalized === "paid";
-}
-
-export function workersPaidFromSubscriptions(subscriptions: CloudflareSubscription[]): boolean {
-  return subscriptions.some((subscription) =>
-    subscriptionIsActive(subscription.state) &&
-    subscription.rate_plan?.scope?.trim().toLowerCase() === "account" &&
-    subscription.rate_plan?.id?.trim().toLowerCase() === "workers_paid"
-  );
+export function workersPaidFromAccountSettings(settings: WorkersAccountSettings): boolean {
+  return settings.default_usage_model?.trim().toLowerCase() === "standard";
 }
 
 async function resolveWorkersPaid(
@@ -1727,17 +1714,17 @@ async function resolveWorkersPaid(
   logger: DeployLogger,
 ): Promise<boolean> {
   try {
-    const subscriptions = await cloudflareApi<CloudflareSubscription[]>(
+    const settings = await cloudflareApi<WorkersAccountSettings>(
       accessToken,
-      `/accounts/${accountId}/subscriptions`,
+      `/accounts/${accountId}/workers/account-settings`,
       {},
-      "List account subscriptions",
+      "Fetch Worker account settings",
     );
-    const workersPaid = workersPaidFromSubscriptions(subscriptions);
+    const workersPaid = workersPaidFromAccountSettings(settings);
     await logger.info(
       workersPaid
-        ? "Workers Paid verified; enabling CodeMode and ripgit's extended CPU limit."
-        : "Workers Free detected; omitting CodeMode and paid-only Worker limits.",
+        ? "Workers Standard detected; enabling CodeMode and ripgit's extended CPU limit."
+        : "Workers Free or a legacy usage model detected; omitting CodeMode and paid-only Worker limits.",
     );
     return workersPaid;
   } catch (error) {

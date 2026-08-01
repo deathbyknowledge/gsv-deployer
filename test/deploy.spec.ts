@@ -9,7 +9,7 @@ import {
   deleteR2ObjectsBatch,
   detectGsvInstallations,
   resolveReleaseComponents,
-  workersPaidFromSubscriptions,
+  workersPaidFromAccountSettings,
 } from "../src/deploy";
 
 type UploadBundle = Parameters<typeof buildUploadMetadata>[2];
@@ -103,20 +103,12 @@ describe("deployment compatibility", () => {
     expect(metadata.limits).toEqual({ cpu_ms: 200_000, subrequests: 1_000 });
   });
 
-  it("requires an active account-scoped Workers Paid subscription", () => {
-    expect(workersPaidFromSubscriptions([
-      {
-        rate_plan: { id: "workers_paid", scope: "account" },
-        state: "Paid",
-      },
-    ])).toBe(true);
+  it("requires the Workers Standard usage model for paid features", () => {
+    expect(workersPaidFromAccountSettings({ default_usage_model: "standard" })).toBe(true);
+    expect(workersPaidFromAccountSettings({ default_usage_model: " Standard " })).toBe(true);
 
-    for (const subscription of [
-      { rate_plan: { id: "workers_paid", scope: "zone" }, state: "Paid" },
-      { rate_plan: { id: "free", scope: "account" }, state: "Paid" },
-      { rate_plan: { id: "workers_paid", scope: "account" }, state: "Cancelled" },
-    ]) {
-      expect(workersPaidFromSubscriptions([subscription])).toBe(false);
+    for (const defaultUsageModel of ["bundled", "unbound", "free", "", undefined]) {
+      expect(workersPaidFromAccountSettings({ default_usage_model: defaultUsageModel })).toBe(false);
     }
   });
 

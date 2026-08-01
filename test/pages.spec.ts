@@ -4,15 +4,15 @@ import { getDeployHelp } from "../src/deploy-help";
 import { confirmDeletePage, deployPage, homePage, managePage } from "../src/pages";
 
 describe("free deployment copy", () => {
-  it("explains the billing scope and paid-only CodeMode capability", () => {
+  it("explains paid-only CodeMode without requesting billing access", () => {
     const deploy = deployPage(
       [{ id: "account-id", name: "Account" }],
-      "account-settings.read billing.read workers-scripts.write",
+      "account-settings.read workers-scripts.write",
       [],
       [],
     );
 
-    expect(deploy).toContain("Check whether the account uses Workers Free or Paid");
+    expect(deploy).not.toContain("billing");
     const home = homePage("https://github.com/example/gsv");
     expect(home).toContain("Workers Free is supported");
     expect(home).toContain("Workers Paid adds CodeMode and more CPU");

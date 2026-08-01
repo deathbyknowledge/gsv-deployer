@@ -60,15 +60,11 @@ curl https://api.cloudflare.com/client/v4/oauth/scopes \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
 ```
 
-The installer uses `billing.read` only to check whether the selected account
-has an active Workers Paid subscription. Free accounts—and accounts whose plan
-cannot be verified—are deployed without CodeMode's Worker Loader binding or
-ripgit's paid-only CPU limit.
-
-When adding `billing.read` to an existing OAuth client, also enable that scope
-for the client in the Cloudflare dashboard. Changing `OAUTH_SCOPES` only changes
-what the installer requests; existing users must authorize again before their
-access token contains the new scope.
+The installer reads the selected account's Workers account settings using the
+existing Workers permissions. Accounts using the Standard usage model receive
+CodeMode's Worker Loader binding and ripgit's extended CPU limit. Free,
+legacy-model, and unverifiable accounts receive the Free-compatible
+configuration.
 
 Component compatibility comes from each release's checksum manifest. Releases
 that publish the legacy assembler bundle deploy it automatically with the
