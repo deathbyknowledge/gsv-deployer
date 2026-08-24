@@ -66,11 +66,22 @@ CodeMode's Worker Loader binding and ripgit's extended CPU limit. Free,
 legacy-model, and unverifiable accounts receive the Free-compatible
 configuration.
 
-Component compatibility comes from each release's checksum manifest. Releases
-that publish the legacy assembler bundle deploy it automatically with the
-gateway; releases without that checksum never attempt to fetch or deploy it.
-The installer always deploys the complete supported GSV stack, so users do not
-need to choose or understand its internal Worker components.
+Each release publishes a checksum-protected deployment manifest alongside its
+component archives. The manifest is the installer's source of truth for the
+runtime and bundled adapters, including Worker entrypoints, service bindings,
+and public self-URL bindings. Adding a bundled adapter to GSV therefore does not
+require a corresponding code change in this installer. Releases from before the
+manifest are supported by discovering every channel archive in their checksum
+file. The installer always deploys the complete supported GSV stack, so users
+do not need to choose or understand its internal Worker components.
+
+The browser installer and the source-controlled Alchemy deployment consume the
+same release and adapter descriptions, but use different executors. Alchemy owns
+persistent stack state when run from a developer or CI environment. This Worker
+instead uses the user's short-lived Cloudflare OAuth authorization and a durable
+Workflow job to apply the verified release directly. Keeping execution separate
+avoids inventing a filesystem or long-lived Alchemy state store inside a Worker
+while preserving one declarative deployment topology.
 
 Every uploaded GSV Worker receives the same management-tag contract used by
 the `gsv` CLI: `gsv-managed-v1`, `gsv-instance-<name>`, and

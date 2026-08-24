@@ -184,7 +184,6 @@ function sampleJob(id: string): DeployJob {
       accountName: "Test account",
       instance: "gsv",
       version: "v1.2.3",
-      components: ["gateway"],
     },
     steps: [
       {

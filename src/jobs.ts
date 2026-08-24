@@ -487,14 +487,12 @@ function createDeploySteps(options: DeployOptions, now: number): DeployStep[] {
     },
   ];
 
-  if (options.components.some((component) => component.startsWith("channel-"))) {
-    steps.push({
-      id: "adapters",
-      title: "Configure channels",
-      description: "Prepare messaging channels for setup in GSV.",
-      status: "pending",
-    });
-  }
+  steps.push({
+    id: "adapters",
+    title: "Install adapters",
+    description: "Connect the messaging adapters bundled with this release.",
+    status: "pending",
+  });
 
   steps.push({
     id: "finish",

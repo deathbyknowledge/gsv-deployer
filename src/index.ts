@@ -3,7 +3,7 @@ import { Hono, type Context } from "hono";
 export { GsvDeleteWorkflow, GsvDeployWorkflow } from "./workflow";
 export { DeployJobState } from "./deploy-job";
 
-import { completeDeployOptions, fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
+import { fetchReleaseOptions, findExistingGsvInstallations } from "./deploy";
 import type { ExistingGsvInstallation } from "./deploy";
 import departureMonoWoff2 from "./assets/departure-mono.woff2";
 import { ANALYTICS_SCRIPT } from "./analytics";
@@ -284,15 +284,12 @@ app.post("/deploy", async (c) => {
     });
   }
 
-  // Components are an internal release detail, not a product choice. Always
-  // request the complete current stack; release resolution adds assembler only
-  // for legacy releases that actually publish it.
-  const options: DeployOptions = completeDeployOptions({
+  const options: DeployOptions = {
     accountId,
     accountName: account.name,
     instance: (existingTarget?.instance ?? stringField(form, "instance")) || "gsv",
     version: stringField(form, "version") || "latest",
-  });
+  };
 
   const { job, viewToken } = await createJob(c.env, {
     sessionId: current.sessionId,
@@ -552,7 +549,6 @@ app.get("/preview/:kind", (c) => {
         accountName: "My Cloudflare",
         instance: "gsv",
         version: "latest",
-        components: ["gateway", "ripgit", "channel-discord"],
       },
       steps: [
         { id: "authorize", title: "Authorize Cloudflare", description: "Confirm access.", status: "complete", detail: "Authorized My Cloudflare." },
@@ -561,7 +557,7 @@ app.get("/preview/:kind", (c) => {
         { id: "storage", title: "Create storage", description: "Set up storage resources.", status: "complete" },
         { id: "workers", title: "Deploy Workers", description: "Upload Workers.", status: "complete" },
         { id: "bindings", title: "Connect services", description: "Wire Workers together.", status: "complete" },
-        { id: "adapters", title: "Configure channels", description: "Apply channel settings.", status: "complete" },
+        { id: "adapters", title: "Install adapters", description: "Connect bundled adapters.", status: "complete" },
         { id: "finish", title: "Finish setup", description: "Confirm result.", status: "complete" },
       ],
       logs: [
@@ -584,7 +580,6 @@ app.get("/preview/:kind", (c) => {
       accountName: "My Cloudflare",
       instance: "gsv",
       version: "latest",
-      components: ["gateway", "ripgit", "assembler", "channel-discord"],
     },
     steps: [
       { id: "authorize", title: "Authorize Cloudflare", description: "Confirm access.", status: "complete", detail: "Authorized My Cloudflare." },

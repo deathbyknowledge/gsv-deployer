@@ -7,10 +7,20 @@ import { parse as parseToml } from "smol-toml";
 import { getDeployHelp } from "./deploy-help";
 import { deleteDeployCredentials, DeployJobWriter, getDeployCredentials } from "./jobs";
 import { trackEvent } from "./metrics";
+import {
+  DEPLOYMENT_MANIFEST_FILE,
+  legacyTopologyFromChecksums,
+  parseGsvReleaseManifest,
+  topologyFromManifest,
+} from "./release-manifest";
+import type {
+  ReleaseAdapter,
+  ReleaseComponent,
+  ReleaseTopology,
+} from "./release-manifest";
 import type {
   Account,
   AppEnv,
-  DeployAdapterSecrets,
   DeployOptions,
   DeployStepId,
   DeployStepStatus,
@@ -19,9 +29,6 @@ import type {
 const COMPONENT_GATEWAY = "gateway";
 const COMPONENT_RIPGIT = "ripgit";
 const LEGACY_COMPONENT_ASSEMBLER = "assembler";
-const COMPONENT_CHANNEL_WHATSAPP = "channel-whatsapp";
-const COMPONENT_CHANNEL_DISCORD = "channel-discord";
-const COMPONENT_CHANNEL_TELEGRAM = "channel-telegram";
 
 const BUNDLE_CHECKSUMS = "cloudflare-checksums.txt";
 const DEFAULT_DEPLOY_INSTANCE = "gsv";
@@ -29,9 +36,6 @@ const DEFAULT_STORAGE_BUCKET_NAME = "gsv-storage";
 const SCRIPT_GATEWAY = "gsv";
 const SCRIPT_RIPGIT = "ripgit";
 const LEGACY_SCRIPT_ASSEMBLER = "gsv-assembler";
-const SCRIPT_CHANNEL_WHATSAPP = "gsv-channel-whatsapp";
-const SCRIPT_CHANNEL_DISCORD = "gsv-channel-discord";
-const SCRIPT_CHANNEL_TELEGRAM = "gsv-channel-telegram";
 const RIPGIT_PAID_CPU_LIMIT_MS = 300_000;
 const WORKER_TAG_MANAGED = "gsv-managed-v1";
 const WORKER_TAG_INSTANCE_PREFIX = "gsv-instance-";
@@ -52,27 +56,6 @@ const CLEANUP_WORKFLOW_STEP_CONFIG = {
   timeout: "2 minutes",
   retries: { limit: 3, delay: "10 seconds", backoff: "linear" },
 } as const;
-
-export const ALL_COMPONENTS = [
-  COMPONENT_RIPGIT,
-  COMPONENT_GATEWAY,
-  COMPONENT_CHANNEL_WHATSAPP,
-  COMPONENT_CHANNEL_DISCORD,
-  COMPONENT_CHANNEL_TELEGRAM,
-] as const;
-
-export function completeDeployOptions(options: Omit<DeployOptions, "components">): DeployOptions {
-  return { ...options, components: [...ALL_COMPONENTS] };
-}
-
-const COMPONENT_TO_BUNDLE: Record<string, string> = {
-  [LEGACY_COMPONENT_ASSEMBLER]: "gsv-cloudflare-assembler.tar.gz",
-  [COMPONENT_GATEWAY]: "gsv-cloudflare-gateway.tar.gz",
-  [COMPONENT_RIPGIT]: "gsv-cloudflare-ripgit.tar.gz",
-  [COMPONENT_CHANNEL_WHATSAPP]: "gsv-cloudflare-channel-whatsapp.tar.gz",
-  [COMPONENT_CHANNEL_DISCORD]: "gsv-cloudflare-channel-discord.tar.gz",
-  [COMPONENT_CHANNEL_TELEGRAM]: "gsv-cloudflare-channel-telegram.tar.gz",
-};
 
 type GitHubRelease = {
   tag_name: string;
@@ -138,6 +121,10 @@ type WranglerConfig = {
     service: string;
     environment?: string;
     entrypoint?: string;
+    props?: {
+      id: string;
+      calls: string[];
+    };
   }>;
   worker_loaders?: Array<{ binding: string }>;
   ai?: { binding: string; staging?: boolean };
@@ -157,6 +144,7 @@ type WranglerConfig = {
 
 type PreparedBundle = {
   component: string;
+  adapter?: ReleaseAdapter;
   manifest: BundleManifest;
   files: Map<string, Uint8Array>;
   wrangler: WranglerConfig;
@@ -229,6 +217,7 @@ type DeploymentPlan = {
   version: string;
   instance: DeployInstance;
   components: string[];
+  adapters: ReleaseAdapter[];
   artifactCachePrefix: string;
 };
 
@@ -244,9 +233,13 @@ type DeploymentResult = {
 
 type DeploymentPhase = {
   accessToken: string;
-  adapterSecrets: DeployAdapterSecrets;
   writer: DeployJobWriter;
   logger: DeployLogger;
+};
+
+type PreparedRelease = {
+  bundles: PreparedBundle[];
+  topology: ReleaseTopology;
 };
 
 type ReleaseArtifactSource =
@@ -539,11 +532,8 @@ export async function runDeployWorkflow(
     );
 
     await step.do("configure adapters and finish", DEPLOY_WORKFLOW_STEP_CONFIG, async () =>
-      withDeploymentPhase(env, jobId, async ({ accessToken, adapterSecrets, writer, logger }) => {
+      withDeploymentPhase(env, jobId, async ({ writer, logger }) => {
         const result = await configureAdaptersAndFinish(
-          accessToken,
-          writer.job.options,
-          adapterSecrets,
           deploymentPlan,
           preflight,
           logger,
@@ -606,10 +596,6 @@ async function loadDeploymentPhase(env: AppEnv["Bindings"], jobId: string): Prom
 
   return {
     accessToken: credentials.accessToken,
-    adapterSecrets: {
-      discordBotToken: credentials.discordBotToken,
-      telegramBotToken: credentials.telegramBotToken,
-    },
     writer,
     logger: new DeployLogger(writer),
   };
@@ -630,27 +616,35 @@ async function prepareDeploymentPlan(
   logger: DeployLogger,
 ): Promise<DeploymentPlan> {
   const instance = parseInstance(options.instance);
-  const requestedComponents = normalizeComponents(options.components).sort((a, b) => deployOrder(a) - deployOrder(b));
-  if (requestedComponents.length === 0) throw new Error("No components selected.");
 
   const repoOwner = env.GSV_REPO_OWNER || "deathbyknowledge";
   const repoName = env.GSV_REPO_NAME || "gsv";
   await logger.step("release", "running", "Looking up the requested GSV release.");
   const version = await resolveReleaseTag(repoOwner, repoName, options.version, logger);
   await logger.step("release", "complete", `Using ${version}.`);
-  await logger.info(`Preparing ${requestedComponents.join(", ")} from ${version}.`);
+  await logger.info(`Preparing the complete GSV stack from ${version}.`);
 
   await logger.step("prepare", "running", "Downloading and verifying the selected GSV release.");
   const artifactCachePrefix = deploymentArtifactCachePrefix(jobId);
-  const prepared = await prepareBundles(env, repoOwner, repoName, version, requestedComponents, instance, logger, {
+  const prepared = await prepareBundles(env, repoOwner, repoName, version, instance, logger, {
     kind: "release",
     snapshotPrefix: artifactCachePrefix,
   });
-  const components = prepared.map((bundle) => bundle.component);
-  if (components.length === 0) throw new Error(`None of the selected components are available in ${version}.`);
+  const components = prepared.bundles.map((bundle) => bundle.component);
+  if (components.length === 0) {
+    throw new Error(`The GSV release ${version} contains no deployable components.`);
+  }
   await logger.step("prepare", "complete", "The GSV release is verified and ready.");
 
-  return { repoOwner, repoName, version, instance, components, artifactCachePrefix };
+  return {
+    repoOwner,
+    repoName,
+    version,
+    instance,
+    components,
+    adapters: prepared.topology.manifest?.adapters ?? [],
+    artifactCachePrefix,
+  };
 }
 
 async function inspectDeploymentTarget(
@@ -710,6 +704,7 @@ async function deployWorkerScripts(
       instance: plan.instance,
       selectedComponents,
       availableScripts,
+      adapters: plan.adapters,
       accountSubdomain,
       existingMigrationTag: existingScriptsWithMigrations.get(bundle.scriptName)?.migrationTag ?? null,
       includeMigrations: true,
@@ -753,6 +748,7 @@ async function finalizeWorkerBindings(
       instance: plan.instance,
       selectedComponents,
       availableScripts,
+      adapters: plan.adapters,
       accountSubdomain,
       existingMigrationTag: null,
       includeMigrations: false,
@@ -769,9 +765,6 @@ async function finalizeWorkerBindings(
 }
 
 async function configureAdaptersAndFinish(
-  accessToken: string,
-  options: DeployOptions,
-  adapterSecrets: DeployAdapterSecrets,
   plan: DeploymentPlan,
   preflight: DeploymentPreflight,
   logger: DeployLogger,
@@ -782,34 +775,12 @@ async function configureAdaptersAndFinish(
 
   const hasChannelComponents = [...selectedComponents].some((component) => component.startsWith("channel-"));
   if (hasChannelComponents) {
-    await logger.step("adapters", "running", "Applying channel configuration.");
-  }
-  let configuredChannels = 0;
-  if (selectedComponents.has(COMPONENT_CHANNEL_DISCORD) && adapterSecrets.discordBotToken) {
-    await setWorkerSecret(
-      accessToken,
-      options.accountId,
-      scriptNameForComponent(plan.instance, COMPONENT_CHANNEL_DISCORD),
-      "DISCORD_BOT_TOKEN",
-      adapterSecrets.discordBotToken,
+    await logger.step("adapters", "running", "Confirming adapter deployment.");
+    const outcome = adapterConfigurationOutcome(
+      plan.adapters,
+      [...selectedComponents],
+      accountSubdomain,
     );
-    await logger.info("Configured DISCORD_BOT_TOKEN.");
-    configuredChannels += 1;
-  }
-
-  if (selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) && adapterSecrets.telegramBotToken) {
-    await setWorkerSecret(
-      accessToken,
-      options.accountId,
-      scriptNameForComponent(plan.instance, COMPONENT_CHANNEL_TELEGRAM),
-      "TELEGRAM_BOT_TOKEN",
-      adapterSecrets.telegramBotToken,
-    );
-    await logger.info("Configured TELEGRAM_BOT_TOKEN.");
-    configuredChannels += 1;
-  }
-  if (hasChannelComponents) {
-    const outcome = adapterConfigurationOutcome([...selectedComponents], accountSubdomain, configuredChannels);
     await logger.step(
       "adapters",
       outcome.status,
@@ -837,18 +808,20 @@ async function configureAdaptersAndFinish(
 }
 
 export function adapterConfigurationOutcome(
+  adapters: readonly ReleaseAdapter[],
   selectedComponents: readonly string[],
   accountSubdomain: string | null,
-  configuredChannels: number,
 ): { status: "complete" | "warning"; detail: string } {
-  const detail =
-    configuredChannels > 0
-      ? "Provided channel credentials are configured. Other channels can be connected later in GSV."
-      : "Messaging channels are installed and can be connected later in GSV.";
-  if (selectedComponents.includes(COMPONENT_CHANNEL_TELEGRAM) && !accountSubdomain) {
+  const detail = "Messaging adapters are installed and can be connected later in GSV.";
+  const needsPublicUrl = adapters.some(
+    (adapter) => adapter.standalone.selfUrlBinding !== undefined,
+  ) || (
+    adapters.length === 0 && selectedComponents.includes("channel-telegram")
+  );
+  if (needsPublicUrl && !accountSubdomain) {
     return {
       status: "warning",
-      detail: `${detail} Telegram's webhook URL could not be configured because the workers.dev subdomain was unavailable.`,
+      detail: `${detail} A webhook URL could not be configured because the workers.dev subdomain was unavailable.`,
     };
   }
   return { status: "complete", detail };
@@ -861,10 +834,19 @@ async function prepareBundlesForPhase(
   message: string,
 ): Promise<PreparedBundle[]> {
   await logger.info(message);
-  return prepareBundles(env, plan.repoOwner, plan.repoName, plan.version, plan.components, plan.instance, SILENT_LOGGER, {
-    kind: "snapshot",
-    snapshotPrefix: plan.artifactCachePrefix,
-  });
+  const prepared = await prepareBundles(
+    env,
+    plan.repoOwner,
+    plan.repoName,
+    plan.version,
+    plan.instance,
+    SILENT_LOGGER,
+    {
+      kind: "snapshot",
+      snapshotPrefix: plan.artifactCachePrefix,
+    },
+  );
+  return prepared.bundles;
 }
 
 async function recordDeploymentSuccess(
@@ -903,32 +885,14 @@ async function recordDeploymentFailureWithWriter(
   await writer.flush(true);
 }
 
-function normalizeComponents(raw: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const component of raw) {
-    if (!COMPONENT_TO_BUNDLE[component]) throw new Error(`Unknown component: ${component}`);
-    if (!seen.has(component)) {
-      seen.add(component);
-      out.push(component);
-    }
-  }
-  return out;
-}
-
 export function resolveReleaseComponents(
-  requestedComponents: string[],
+  topology: ReleaseTopology,
   checksums: ReadonlyMap<string, string>,
-): string[] {
-  const resolved = new Set<string>();
+): ReleaseComponent[] {
   const missingBundles: string[] = [];
-  for (const component of requestedComponents) {
-    const bundleFile = COMPONENT_TO_BUNDLE[component];
-    if (!bundleFile) throw new Error(`Unknown component: ${component}`);
-    if (checksums.has(bundleFile)) {
-      resolved.add(component);
-    } else if (component !== LEGACY_COMPONENT_ASSEMBLER) {
-      missingBundles.push(bundleFile);
+  for (const component of topology.components) {
+    if (!checksums.has(component.bundleFile)) {
+      missingBundles.push(component.bundleFile);
     }
   }
   if (missingBundles.length > 0) {
@@ -936,13 +900,7 @@ export function resolveReleaseComponents(
       `Unsupported GSV release: the release does not include the complete stack (${missingBundles.join(", ")}). Choose Latest stable and try again.`,
     );
   }
-
-  const assemblerBundle = COMPONENT_TO_BUNDLE[LEGACY_COMPONENT_ASSEMBLER];
-  if (resolved.has(COMPONENT_GATEWAY) && checksums.has(assemblerBundle)) {
-    resolved.add(LEGACY_COMPONENT_ASSEMBLER);
-  }
-
-  return [...resolved].sort((a, b) => deployOrder(a) - deployOrder(b));
+  return topology.components;
 }
 
 function dedupeReleaseOptions(options: ReleaseOption[]): ReleaseOption[] {
@@ -979,10 +937,17 @@ export function detectGsvInstallations(
       components = new Map<string, DetectedComponent>();
       instances.set(instance, components);
     }
+    let canonicalScriptName = false;
+    try {
+      canonicalScriptName =
+        scriptNameForComponent(parseInstance(instance), component) === script.id;
+    } catch {
+      canonicalScriptName = false;
+    }
     const candidate = {
       scriptName: script.id,
       verified:
-        componentForInstallationScriptName(instance, script.id) === component &&
+        canonicalScriptName &&
         hasExpectedWorkerTags(script.tags ?? [], instance, component),
     };
     const existing = components.get(component);
@@ -1036,7 +1001,7 @@ function managedWorkerIdentity(
 
   const instance = instances[0];
   const component = components[0];
-  if (!instance || !component || !COMPONENT_TO_BUNDLE[component]) return null;
+  if (!instance || !component || !isDeployableComponent(component)) return null;
 
   try {
     if (scriptNameForComponent(parseInstance(instance), component) !== script.id) return null;
@@ -1074,10 +1039,15 @@ function prefixedTagValues(tags: readonly string[], prefix: string): string[] {
 
 function componentForScriptName(scriptName: string): { instance: string; component: string } | null {
   if (scriptName === SCRIPT_RIPGIT) return { instance: DEFAULT_DEPLOY_INSTANCE, component: COMPONENT_RIPGIT };
+  const channelMarker = scriptName.lastIndexOf("-channel-");
+  if (channelMarker > 0) {
+    const instance = scriptName.slice(0, channelMarker);
+    const adapterId = scriptName.slice(channelMarker + "-channel-".length);
+    if (/^[a-z][a-z0-9-]*$/.test(adapterId)) {
+      return { instance, component: `channel-${adapterId}` };
+    }
+  }
   const suffixes: Array<[string, string]> = [
-    ["-channel-whatsapp", COMPONENT_CHANNEL_WHATSAPP],
-    ["-channel-discord", COMPONENT_CHANNEL_DISCORD],
-    ["-channel-telegram", COMPONENT_CHANNEL_TELEGRAM],
     ["-assembler", LEGACY_COMPONENT_ASSEMBLER],
     ["-ripgit", COMPONENT_RIPGIT],
   ];
@@ -1090,15 +1060,16 @@ function componentForScriptName(scriptName: string): { instance: string; compone
 }
 
 function componentForInstallationScriptName(instance: string, scriptName: string): string | null {
-  const deployInstance: DeployInstance = {
-    name: instance,
-    isDefault: instance === DEFAULT_DEPLOY_INSTANCE,
-    storageBucketName: `${instance}-storage`,
-  };
-  for (const component of Object.keys(COMPONENT_TO_BUNDLE)) {
-    if (scriptNameForComponent(deployInstance, component) === scriptName) return component;
-  }
-  return null;
+  if (scriptName === instance) return COMPONENT_GATEWAY;
+  const match = componentForScriptName(scriptName);
+  return match?.instance === instance ? match.component : null;
+}
+
+function isDeployableComponent(component: string): boolean {
+  return component === COMPONENT_GATEWAY ||
+    component === COMPONENT_RIPGIT ||
+    component === LEGACY_COMPONENT_ASSEMBLER ||
+    /^channel-[a-z][a-z0-9-]*$/.test(component);
 }
 
 function formatCount(count: number, noun: string): string {
@@ -1115,16 +1086,10 @@ function deployOrder(component: string): number {
       return 0;
     case LEGACY_COMPONENT_ASSEMBLER:
       return 1;
-    case COMPONENT_CHANNEL_WHATSAPP:
-      return 2;
-    case COMPONENT_CHANNEL_DISCORD:
-      return 3;
-    case COMPONENT_CHANNEL_TELEGRAM:
-      return 4;
     case COMPONENT_GATEWAY:
       return 10;
     default:
-      return 100;
+      return component.startsWith("channel-") ? 5 : 100;
   }
 }
 
@@ -1145,9 +1110,9 @@ function parseInstance(raw: string): DeployInstance {
   if (
     name !== DEFAULT_DEPLOY_INSTANCE &&
     (name === SCRIPT_RIPGIT ||
-      ["-assembler", "-ripgit", "-channel-whatsapp", "-channel-discord", "-channel-telegram"].some((suffix) =>
-        name.endsWith(suffix),
-      ))
+      name.endsWith("-assembler") ||
+      name.endsWith("-ripgit") ||
+      name.includes("-channel-"))
   ) {
     throw new Error("GSV instance name would collide with generated component worker names.");
   }
@@ -1167,13 +1132,10 @@ function scriptNameForComponent(instance: DeployInstance, component: string): st
       return `${instance.name}-assembler`;
     case COMPONENT_RIPGIT:
       return instance.isDefault ? SCRIPT_RIPGIT : `${instance.name}-ripgit`;
-    case COMPONENT_CHANNEL_WHATSAPP:
-      return `${instance.name}-channel-whatsapp`;
-    case COMPONENT_CHANNEL_DISCORD:
-      return `${instance.name}-channel-discord`;
-    case COMPONENT_CHANNEL_TELEGRAM:
-      return `${instance.name}-channel-telegram`;
     default:
+      if (/^channel-[a-z][a-z0-9-]*$/.test(component)) {
+        return `${instance.name}-${component}`;
+      }
       throw new Error(`Unsupported component: ${component}`);
   }
 }
@@ -1215,13 +1177,13 @@ function scriptNameForConfigService(instance: DeployInstance, service: string): 
       return scriptNameForComponent(instance, LEGACY_COMPONENT_ASSEMBLER);
     case SCRIPT_RIPGIT:
       return scriptNameForComponent(instance, COMPONENT_RIPGIT);
-    case SCRIPT_CHANNEL_WHATSAPP:
-      return scriptNameForComponent(instance, COMPONENT_CHANNEL_WHATSAPP);
-    case SCRIPT_CHANNEL_DISCORD:
-      return scriptNameForComponent(instance, COMPONENT_CHANNEL_DISCORD);
-    case SCRIPT_CHANNEL_TELEGRAM:
-      return scriptNameForComponent(instance, COMPONENT_CHANNEL_TELEGRAM);
     default:
+      if (service.startsWith(`${SCRIPT_GATEWAY}-channel-`)) {
+        return scriptNameForComponent(
+          instance,
+          service.slice(`${SCRIPT_GATEWAY}-`.length),
+        );
+      }
       return service;
   }
 }
@@ -1311,46 +1273,95 @@ async function prepareBundles(
   repoOwner: string,
   repoName: string,
   version: string,
-  components: string[],
   instance: DeployInstance,
   logger: InfoLogger,
   source: ReleaseArtifactSource,
-): Promise<PreparedBundle[]> {
+): Promise<PreparedRelease> {
   const checksumsUrl = releaseDownloadUrl(repoOwner, repoName, version, BUNDLE_CHECKSUMS);
   await logger.info(`Fetching checksums from ${checksumsUrl}.`);
   const checksumsAsset = await fetchReleaseAsset(env, repoOwner, repoName, version, BUNDLE_CHECKSUMS, "Fetch bundle checksums", logger, source);
   const checksumsText = decodeText(checksumsAsset.bytes);
   const checksums = parseChecksums(checksumsText);
-  const releaseComponents = resolveReleaseComponents(components, checksums);
-  const requestedAssembler = components.includes(LEGACY_COMPONENT_ASSEMBLER);
-  const releaseHasAssembler = releaseComponents.includes(LEGACY_COMPONENT_ASSEMBLER);
-  if (!requestedAssembler && releaseHasAssembler) {
-    await logger.info("This release requires the legacy assembler Worker; including it automatically.");
-  } else if (requestedAssembler && !releaseHasAssembler) {
-    await logger.info("This release does not include the legacy assembler Worker; skipping it.");
-  }
   const bundles: PreparedBundle[] = [];
   const validatedAssets: FetchedReleaseAsset[] = [checksumsAsset];
+  const topology = await loadReleaseTopology(
+    env,
+    repoOwner,
+    repoName,
+    version,
+    checksums,
+    logger,
+    source,
+    validatedAssets,
+  );
+  const releaseComponents = resolveReleaseComponents(topology, checksums);
 
   for (const component of releaseComponents) {
-    const bundleFile = COMPONENT_TO_BUNDLE[component];
-    const expected = checksums.get(bundleFile);
-    if (!expected) throw new Error(`Missing checksum entry for ${bundleFile}.`);
+    const expected = checksums.get(component.bundleFile);
+    if (!expected) throw new Error(`Missing checksum entry for ${component.bundleFile}.`);
 
-    await logger.info(`Downloading ${component} bundle.`);
-    const bundleAsset = await fetchReleaseAsset(env, repoOwner, repoName, version, bundleFile, `Download ${component} bundle`, logger, source);
+    await logger.info(`Downloading ${component.id} bundle.`);
+    const bundleAsset = await fetchReleaseAsset(env, repoOwner, repoName, version, component.bundleFile, `Download ${component.id} bundle`, logger, source);
     const bytes = bundleAsset.bytes;
     const actual = await sha256Hex(bytes);
     if (actual !== expected) {
-      throw new Error(`Checksum mismatch for ${bundleFile}: expected ${expected}, got ${actual}.`);
+      throw new Error(`Checksum mismatch for ${component.bundleFile}: expected ${expected}, got ${actual}.`);
     }
-    await logger.info(`Checksum OK for ${bundleFile}.`);
+    await logger.info(`Checksum OK for ${component.bundleFile}.`);
     bundles.push(await prepareBundle(component, bytes, instance));
     validatedAssets.push(bundleAsset);
   }
 
   await cacheValidatedReleaseAssets(env, repoOwner, repoName, version, source, validatedAssets, logger);
-  return bundles.sort((a, b) => deployOrder(a.component) - deployOrder(b.component));
+  return { bundles, topology };
+}
+
+async function loadReleaseTopology(
+  env: AppEnv["Bindings"],
+  repoOwner: string,
+  repoName: string,
+  version: string,
+  checksums: ReadonlyMap<string, string>,
+  logger: InfoLogger,
+  source: ReleaseArtifactSource,
+  validatedAssets: FetchedReleaseAsset[],
+): Promise<ReleaseTopology> {
+  const expected = checksums.get(DEPLOYMENT_MANIFEST_FILE);
+  if (!expected) {
+    await logger.info(
+      "This release predates the deployment manifest; discovering its bundled adapters from checksums.",
+    );
+    return legacyTopologyFromChecksums(checksums);
+  }
+
+  const asset = await fetchReleaseAsset(
+    env,
+    repoOwner,
+    repoName,
+    version,
+    DEPLOYMENT_MANIFEST_FILE,
+    "Download deployment manifest",
+    logger,
+    source,
+  );
+  const actual = await sha256Hex(asset.bytes);
+  if (actual !== expected) {
+    throw new Error(
+      `Checksum mismatch for ${DEPLOYMENT_MANIFEST_FILE}: expected ${expected}, got ${actual}.`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decodeText(asset.bytes));
+  } catch {
+    throw new Error("The GSV deployment manifest is not valid JSON.");
+  }
+  const manifest = parseGsvReleaseManifest(parsed);
+  validatedAssets.push(asset);
+  await logger.info(
+    `Deployment manifest verified with ${manifest.adapters.length} bundled adapter${manifest.adapters.length === 1 ? "" : "s"}.`,
+  );
+  return topologyFromManifest(manifest);
 }
 
 function releaseDownloadUrl(repoOwner: string, repoName: string, tag: string, fileName: string): string {
@@ -1532,6 +1543,7 @@ async function writeReleaseAssetCache(
 
 function releaseAssetContentType(fileName: string): string {
   if (fileName.endsWith(".tar.gz")) return "application/gzip";
+  if (fileName.endsWith(".json")) return "application/json; charset=utf-8";
   if (fileName.endsWith(".txt")) return "text/plain; charset=utf-8";
   return "application/octet-stream";
 }
@@ -1578,16 +1590,21 @@ function parseChecksums(content: string): Map<string, string> {
 }
 
 async function prepareBundle(
-  component: string,
+  component: ReleaseComponent,
   compressedBytes: Uint8Array,
   instance: DeployInstance,
 ): Promise<PreparedBundle> {
   const entries = parseTar(ungzip(compressedBytes));
-  const files = normalizeBundleFiles(entries, component);
+  const files = normalizeBundleFiles(entries, component.id);
   const manifest = readJson<BundleManifest>(files, "manifest.json");
+  if (manifest.component !== component.id) {
+    throw new Error(
+      `Bundle ${component.bundleFile} identifies component ${manifest.component} instead of ${component.id}.`,
+    );
+  }
   const wranglerPath = manifest.worker.wranglerConfig ?? manifest.worker.wrangler_config ?? "wrangler.jsonc";
   const wrangler = parseWranglerConfig(wranglerPath, readText(files, wranglerPath));
-  wrangler.name = scriptNameForComponent(instance, component);
+  wrangler.name = scriptNameForComponent(instance, component.id);
 
   for (const bucket of wrangler.r2_buckets ?? []) {
     if (bucket.bucket_name === DEFAULT_STORAGE_BUCKET_NAME) {
@@ -1606,7 +1623,8 @@ async function prepareBundle(
       : undefined;
 
   return {
-    component,
+    component: component.id,
+    ...(component.adapter ? { adapter: component.adapter } : {}),
     manifest,
     files,
     wrangler,
@@ -1830,6 +1848,7 @@ type MetadataOptions = {
   instance: DeployInstance;
   selectedComponents: Set<string>;
   availableScripts: Set<string>;
+  adapters: ReleaseAdapter[];
   accountSubdomain: string | null;
   existingMigrationTag: string | null;
   includeMigrations: boolean;
@@ -1891,6 +1910,7 @@ export async function buildUploadMetadata(
     };
     if (service.environment) value.environment = service.environment;
     if (service.entrypoint) value.entrypoint = service.entrypoint;
+    if (service.props) value.props = service.props;
     bindings.push(value);
   }
 
@@ -1909,9 +1929,11 @@ export async function buildUploadMetadata(
     bindings.push(value);
   }
 
-  if (bundle.component === COMPONENT_CHANNEL_TELEGRAM && options.accountSubdomain) {
+  const selfUrlBinding = bundle.adapter?.standalone.selfUrlBinding ??
+    (bundle.component === "channel-telegram" ? "TELEGRAM_WEBHOOK_BASE_URL" : undefined);
+  if (selfUrlBinding && options.accountSubdomain) {
     bindings.push({
-      name: "TELEGRAM_WEBHOOK_BASE_URL",
+      name: selfUrlBinding,
       type: "plain_text",
       text: workersDevUrl(bundle.scriptName, options.accountSubdomain),
     });
@@ -1958,29 +1980,65 @@ function paidLimitsForBundle(bundle: PreparedBundle): NonNullable<WranglerConfig
 
 function serviceBindingsForBundle(
   bundle: PreparedBundle,
-  options: Pick<MetadataOptions, "instance" | "selectedComponents" | "availableScripts">,
-): Array<{ binding: string; service: string; environment?: string; entrypoint?: string }> {
-  const bindings = [...(bundle.wrangler.services ?? [])];
+  options: Pick<
+    MetadataOptions,
+    "instance" | "selectedComponents" | "availableScripts" | "adapters"
+  >,
+): Array<{
+  binding: string;
+  service: string;
+  environment?: string;
+  entrypoint?: string;
+  props?: { id: string; calls: string[] };
+}> {
+  let bindings = [...(bundle.wrangler.services ?? [])];
   const gatewayScriptName = scriptNameForComponent(options.instance, COMPONENT_GATEWAY);
-  const telegramScriptName = scriptNameForComponent(options.instance, COMPONENT_CHANNEL_TELEGRAM);
 
-  if (
-    bundle.component === COMPONENT_CHANNEL_WHATSAPP &&
-    !bindings.some((binding) => binding.binding === "GATEWAY") &&
-    (options.selectedComponents.has(COMPONENT_GATEWAY) || options.availableScripts.has(gatewayScriptName))
-  ) {
-    bindings.push({ binding: "GATEWAY", service: gatewayScriptName, entrypoint: "GatewayEntrypoint" });
+  if (bundle.component === COMPONENT_GATEWAY && options.adapters.length > 0) {
+    bindings = bindings.filter(
+      (binding) => !binding.binding.startsWith("CHANNEL_"),
+    );
+    for (const adapter of options.adapters) {
+      const component = `channel-${adapter.id}`;
+      const service = scriptNameForComponent(options.instance, component);
+      if (
+        options.selectedComponents.has(component) ||
+        options.availableScripts.has(service)
+      ) {
+        bindings.push({
+          binding: adapter.gatewayBinding,
+          service,
+          entrypoint: adapter.standalone.gatewayEntrypoint,
+        });
+      }
+    }
   }
 
-  if (
-    bundle.component === COMPONENT_GATEWAY &&
-    !bindings.some((binding) => binding.binding === "CHANNEL_TELEGRAM") &&
-    (options.selectedComponents.has(COMPONENT_CHANNEL_TELEGRAM) || options.availableScripts.has(telegramScriptName))
-  ) {
-    bindings.push({ binding: "CHANNEL_TELEGRAM", service: telegramScriptName, entrypoint: "TelegramChannel" });
+  if (bundle.adapter) {
+    bindings = bindings.filter((binding) => binding.binding !== "GATEWAY");
+    if (
+      options.selectedComponents.has(COMPONENT_GATEWAY) ||
+      options.availableScripts.has(gatewayScriptName)
+    ) {
+      bindings.push({
+        binding: "GATEWAY",
+        service: gatewayScriptName,
+        entrypoint: "AdapterGatewayEntrypoint",
+        props: {
+          id: bundle.adapter.id,
+          calls: ["adapter.inbound", "adapter.state.update"],
+        },
+      });
+    }
   }
 
-  const out: Array<{ binding: string; service: string; environment?: string; entrypoint?: string }> = [];
+  const out: Array<{
+    binding: string;
+    service: string;
+    environment?: string;
+    entrypoint?: string;
+    props?: { id: string; calls: string[] };
+  }> = [];
   for (const raw of bindings) {
     const binding = { ...raw };
     if (
@@ -2152,24 +2210,6 @@ async function uploadWorkerScript(
     { method: "PUT", headers: { Authorization: `Bearer ${accessToken}` }, body: form },
   );
   await parseCloudflareEnvelope(response, `Upload script ${bundle.scriptName}${keepExistingAssets ? " bindings" : ""}`);
-}
-
-async function setWorkerSecret(
-  accessToken: string,
-  accountId: string,
-  scriptName: string,
-  secretName: string,
-  secretValue: string,
-): Promise<void> {
-  await cloudflareApi(
-    accessToken,
-    `/accounts/${accountId}/workers/scripts/${scriptName}/secrets`,
-    {
-      method: "PUT",
-      body: JSON.stringify({ name: secretName, text: secretValue, type: "secret_text" }),
-    },
-    `Set worker secret ${secretName}`,
-  );
 }
 
 async function cloudflareApi<T>(

@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  ALL_COMPONENTS,
   adapterConfigurationOutcome,
   buildUploadMetadata,
-  completeDeployOptions,
   deleteGsvWorkers,
   deleteR2ObjectsBatch,
   detectGsvInstallations,
   resolveReleaseComponents,
   workersPaidFromAccountSettings,
 } from "../src/deploy";
+import {
+  legacyTopologyFromChecksums,
+  parseGsvReleaseManifest,
+} from "../src/release-manifest";
 
 type UploadBundle = Parameters<typeof buildUploadMetadata>[2];
 type MetadataOptions = Parameters<typeof buildUploadMetadata>[3];
@@ -20,45 +22,115 @@ describe("deployment compatibility", () => {
     vi.unstubAllGlobals();
   });
 
-  it("deploys only current GSV components", () => {
-    expect(ALL_COMPONENTS).not.toContain("assembler");
-    expect(completeDeployOptions({
-      accountId: "account-id",
-      instance: "gsv",
-      version: "latest",
-    }).components).toEqual(ALL_COMPONENTS);
-  });
-
   it("derives legacy assembler compatibility from the release checksums", () => {
     const currentChecksums = new Map([
       ["gsv-cloudflare-ripgit.tar.gz", "ripgit-hash"],
       ["gsv-cloudflare-gateway.tar.gz", "gateway-hash"],
     ]);
-    expect(resolveReleaseComponents(["ripgit", "assembler", "gateway"], currentChecksums)).toEqual([
+    expect(resolveReleaseComponents(
+      legacyTopologyFromChecksums(currentChecksums),
+      currentChecksums,
+    ).map((component) => component.id)).toEqual([
       "ripgit",
       "gateway",
     ]);
 
     const legacyChecksums = new Map(currentChecksums);
     legacyChecksums.set("gsv-cloudflare-assembler.tar.gz", "assembler-hash");
-    expect(resolveReleaseComponents(["ripgit", "gateway"], legacyChecksums)).toEqual([
+    expect(resolveReleaseComponents(
+      legacyTopologyFromChecksums(legacyChecksums),
+      legacyChecksums,
+    ).map((component) => component.id)).toEqual([
       "ripgit",
       "assembler",
       "gateway",
     ]);
 
-    expect(() => resolveReleaseComponents(["gateway"], new Map())).toThrow(
+    expect(() => resolveReleaseComponents(
+      {
+        manifest: null,
+        components: [{
+          id: "gateway",
+          bundleFile: "gsv-cloudflare-gateway.tar.gz",
+        }],
+      },
+      new Map(),
+    )).toThrow(
       "Unsupported GSV release: the release does not include the complete stack (gsv-cloudflare-gateway.tar.gz). Choose Latest stable and try again.",
     );
   });
 
-  it("warns when Telegram cannot receive a webhook URL", () => {
-    expect(adapterConfigurationOutcome(["channel-telegram"], null, 0)).toEqual({
+  it("warns when an adapter cannot receive its webhook URL", () => {
+    const adapter = releaseAdapter();
+    expect(adapterConfigurationOutcome([adapter], ["channel-test"], null)).toEqual({
       status: "warning",
       detail:
-        "Messaging channels are installed and can be connected later in GSV. Telegram's webhook URL could not be configured because the workers.dev subdomain was unavailable.",
+        "Messaging adapters are installed and can be connected later in GSV. A webhook URL could not be configured because the workers.dev subdomain was unavailable.",
     });
-    expect(adapterConfigurationOutcome(["channel-telegram"], "example", 1).status).toBe("complete");
+    expect(adapterConfigurationOutcome([adapter], ["channel-test"], "example").status).toBe("complete");
+  });
+
+  it("builds both service-binding directions from the adapter manifest", async () => {
+    const adapter = releaseAdapter();
+    const adapterBundle = ripgitBundle();
+    adapterBundle.component = "channel-test";
+    adapterBundle.adapter = adapter;
+    adapterBundle.scriptName = "gsv-channel-test";
+    adapterBundle.wrangler.name = adapterBundle.scriptName;
+    adapterBundle.wrangler.services = [{
+      binding: "GATEWAY",
+      service: "stale-gateway",
+      entrypoint: "StaleEntrypoint",
+    }];
+    const adapterOptions = metadataOptions(false);
+    adapterOptions.selectedComponents.add("gateway");
+    adapterOptions.availableScripts.add("gsv");
+    adapterOptions.adapters = [adapter];
+    const adapterMetadata = await buildUploadMetadata(
+      "access-token",
+      "account-id",
+      adapterBundle,
+      adapterOptions,
+    );
+    expect(adapterMetadata.bindings).toContainEqual({
+      name: "GATEWAY",
+      type: "service",
+      service: "gsv",
+      entrypoint: "AdapterGatewayEntrypoint",
+      props: {
+        id: "test",
+        calls: ["adapter.inbound", "adapter.state.update"],
+      },
+    });
+
+    const gatewayBundle = ripgitBundle();
+    gatewayBundle.component = "gateway";
+    gatewayBundle.scriptName = "gsv";
+    gatewayBundle.wrangler.name = "gsv";
+    gatewayBundle.wrangler.services = [{
+      binding: "CHANNEL_OLD",
+      service: "gsv-channel-old",
+      entrypoint: "OldChannel",
+    }];
+    const gatewayOptions = metadataOptions(false);
+    gatewayOptions.selectedComponents.add("channel-test");
+    gatewayOptions.availableScripts.add("gsv-channel-test");
+    gatewayOptions.adapters = [adapter];
+    const gatewayMetadata = await buildUploadMetadata(
+      "access-token",
+      "account-id",
+      gatewayBundle,
+      gatewayOptions,
+    );
+    expect(gatewayMetadata.bindings).toContainEqual({
+      name: "CHANNEL_TEST",
+      type: "service",
+      service: "gsv-channel-test",
+      entrypoint: "TestChannel",
+    });
+    expect(gatewayMetadata.bindings).not.toContainEqual(
+      expect.objectContaining({ name: "CHANNEL_OLD" }),
+    );
   });
 
   it("adds paid Worker features only for verified paid accounts", async () => {
@@ -305,6 +377,31 @@ function ripgitBundle(): UploadBundle {
   };
 }
 
+function releaseAdapter() {
+  return parseGsvReleaseManifest({
+    version: 1,
+    runtime: {
+      gatewayBundle: "gateway.js",
+      webAssets: "assets",
+      ripgitBundle: "ripgit.js",
+    },
+    adapters: [{
+      id: "test",
+      displayName: "Test",
+      gatewayBinding: "CHANNEL_TEST",
+      standalone: {
+        main: "channel-test.js",
+        bundle: false,
+        gatewayEntrypoint: "TestChannel",
+        adapterEntrypoint: "TestChannel",
+        durableObjects: [],
+        requiredSecrets: [],
+        selfUrlBinding: "TEST_WEBHOOK_BASE_URL",
+      },
+    }],
+  }).adapters[0]!;
+}
+
 function metadataOptions(workersPaid: boolean): MetadataOptions {
   return {
     instance: {
@@ -314,6 +411,7 @@ function metadataOptions(workersPaid: boolean): MetadataOptions {
     },
     selectedComponents: new Set(),
     availableScripts: new Set(),
+    adapters: [],
     accountSubdomain: null,
     existingMigrationTag: null,
     includeMigrations: false,

@@ -69,7 +69,6 @@ export type DeployOptions = {
   accountName?: string;
   instance: string;
   version: string;
-  components: string[];
 };
 
 export type DeleteOptions = {

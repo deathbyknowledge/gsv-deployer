@@ -104,7 +104,11 @@ export function classifyDeployError(message: string): DeployHelpCategory {
   const lower = message.toLowerCase();
   if (lower.includes("credentials expired") || lower.includes("authorize cloudflare")) return "auth-expired";
   if (lower.includes("instance name")) return "instance-name";
-  if (lower.includes("no components selected") || lower.includes("unknown component")) return "no-components";
+  if (
+    lower.includes("no components selected") ||
+    lower.includes("no deployable components") ||
+    lower.includes("unknown component")
+  ) return "no-components";
   if (lower.includes("invalid account") || lower.includes("authentication") || lower.includes("unauthorized")) return "auth-rejected";
   if (lower.includes("forbidden") || lower.includes("permission") || lower.includes("scope")) return "permission";
   if (lower.includes("requires ripgit") || lower.includes("requires the legacy assembler")) return "gateway-dependency";
