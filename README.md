@@ -1,5 +1,7 @@
 # GSV Deployment
 
+> **Retired:** This browser installer is no longer maintained. For current deployment instructions, see [Deploy Ship with Alchemy](https://github.com/deathbyknowledge/gsv/blob/main/docs/how-to/deploy-with-alchemy.md). This repository is preserved for historical reference. Retiring the installer does not remove GSV installations previously created with it.
+
 Browser-first installer for GSV on Cloudflare.
 
 This Worker lets a user authorize a Cloudflare account with OAuth, choose a GSV
